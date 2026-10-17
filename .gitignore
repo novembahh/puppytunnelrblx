@@ -1,0 +1,61 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Build / release artifacts
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.map
+
+# Local dev / runtime data
+puppytunnel.json
+temp_in.txt
+.tmp_studio.exe
+~/
+NepTunnel 2.4.exe_extracted/
+pyinstxtractor.py
+
+# Secrets and credentials - NEVER commit
+scripts/roblox_creds.json
+scripts/roblox_creds.txt
+scripts/raw_cookies.bin
+scripts/roblox_reg.reg
+scripts/wine_cred_write.exe
+scripts/wine_cred_write.pdb
+scripts/wine_protect.exe
+scripts/wine_protect.pdb
+*.pem
+*.key
+.env
+.env.*
+.dev.vars
+*.cookie
+cookies*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+scripts/
+
+# Node / Cloudflare
+node_modules/
+.wrangler/
+.dev.vars
+dist/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

@@ -1,0 +1,10 @@
+[package]
+name = "placepatch"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+rbx_binary = "3"
+rbx_dom_weak = "4"
+rbx_types = "3"
