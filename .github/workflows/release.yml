@@ -37,3 +37,14 @@ jobs:
           files: |
             PuppyTunnel-Windows-x86_64.exe
             PuppyTunnel-Windows-x86_64.pdb
+
+      - name: Publish versioned nightly
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0-nightly.${{ github.run_number }}
+          name: Nightly v1.0.0-nightly.${{ github.run_number }}
+          prerelease: true
+          generate_release_notes: false
+          files: |
+            PuppyTunnel-Windows-x86_64.exe
+            PuppyTunnel-Windows-x86_64.pdb

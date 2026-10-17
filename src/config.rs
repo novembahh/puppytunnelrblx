@@ -122,11 +122,11 @@ pub struct AppConfig {
 }
 
 fn default_channel() -> String {
-    "beta".to_string()
+    "nightly".to_string()
 }
 
 fn default_source() -> String {
-    "default".to_string()
+    "github".to_string()
 }
 
 fn default_true() -> bool {
@@ -158,9 +158,9 @@ impl Default for AppConfig {
             profile_accent: "mint".to_string(),
             profile_servers: String::new(),
             show_profile: true,
-            update_channel: "beta".to_string(),
-            update_source_type: "master".to_string(),
-            update_source_url: "https://updates.puppytunnel.vip".to_string(),
+            update_channel: "nightly".to_string(),
+            update_source_type: "github".to_string(),
+            update_source_url: "novembahh/puppytunnelrblx".to_string(),
             auto_update: true,
             update_history: vec![UpdateHistoryEntry {
                 version: "1.0.0-beta.1".to_string(),
@@ -465,5 +465,24 @@ mod tests {
         assert_eq!(decoded.update_source_url, "PuppyTunnel/puppytunnel");
         assert_eq!(decoded.update_history.len(), 2);
         assert_eq!(decoded.update_history[1].version, "1.0.1");
+    }
+
+    #[test]
+    fn test_default_update_source_is_github() {
+        let config = AppConfig::default();
+        assert_eq!(config.update_channel, "nightly");
+        assert_eq!(config.update_source_type, "github");
+        assert_eq!(config.update_source_url, "novembahh/puppytunnelrblx");
+        let src = crate::update::UpdateSource::from_config(
+            &config.update_source_type,
+            &config.update_source_url,
+        );
+        assert_eq!(
+            src,
+            crate::update::UpdateSource::GitHubReleases {
+                owner: "novembahh".into(),
+                repo: "puppytunnelrblx".into(),
+            }
+        );
     }
 }

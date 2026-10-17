@@ -2443,8 +2443,8 @@ impl NepApp {
                     ui.label(muted("Update source"));
                     let mut source_type = self.config.update_source_type.clone();
                     let sources = [
-                        ("master", "default"),
-                        ("github", "github"),
+                        ("github", "github (default)"),
+                        ("master", "master (custom)"),
                         ("direct", "custom url"),
                     ];
                     if segmented(ui, &mut source_type, &sources) {
@@ -2471,14 +2471,19 @@ impl NepApp {
                 } else if self.config.update_source_type == "master" {
                     ui.add_space(4.0);
                     let host = if self.config.update_source_url.is_empty() {
-                        "https://updates.puppytunnel.vip"
+                        "uses GitHub releases (default)"
                     } else {
                         &self.config.update_source_url
                     };
                     ui.label(muted(format!("Endpoint: {}", host)));
                 } else if self.config.update_source_type == "github" {
                     ui.add_space(4.0);
-                    ui.label(muted("Endpoint: github.com/PuppyTunnel/puppytunnel"));
+                    let repo = if self.config.update_source_url.is_empty() {
+                        "novembahh/puppytunnelrblx"
+                    } else {
+                        &self.config.update_source_url
+                    };
+                    ui.label(muted(format!("Endpoint: github.com/{}", repo)));
                 }
             });
 

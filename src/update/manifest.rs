@@ -108,6 +108,11 @@ impl Platform {
 
     pub fn matches_filename(&self, filename: &str) -> bool {
         let f = filename.to_ascii_lowercase();
+        for ext in [".pdb", ".sig", ".asc", ".sha256", ".sha512", ".md5"] {
+            if f.ends_with(ext) {
+                return false;
+            }
+        }
         match self {
             Platform::WindowsX64 => {
                 (f.contains("win") || f.ends_with(".exe"))

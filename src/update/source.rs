@@ -6,6 +6,21 @@ use std::time::Duration;
 const USER_AGENT: &str = "PuppyTunnel-Updater";
 const DEFAULT_TIMEOUT_SECS: u64 = 15;
 
+pub const DEFAULT_GITHUB_OWNER: &str = "novembahh";
+pub const DEFAULT_GITHUB_REPO: &str = "puppytunnelrblx";
+
+pub fn is_retired_update_host(url: &str) -> bool {
+    let t = url.trim().to_ascii_lowercase();
+    t.contains("updates.puppytunnel.vip") || t.contains("master.puppytunnel.com")
+}
+
+fn github_default() -> UpdateSource {
+    UpdateSource::GitHubReleases {
+        owner: DEFAULT_GITHUB_OWNER.to_string(),
+        repo: DEFAULT_GITHUB_REPO.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateSourceError {
     NetworkError(String),
@@ -62,29 +77,25 @@ impl UpdateSource {
         match t.as_str() {
             "github" => {
                 if let Some((owner, repo)) = target.split_once('/') {
-                    UpdateSource::GitHubReleases {
-                        owner: owner.trim().to_string(),
-                        repo: repo.trim().to_string(),
+                    if owner.trim().is_empty() || repo.trim().is_empty() {
+                        github_default()
+                    } else {
+                        UpdateSource::GitHubReleases {
+                            owner: owner.trim().to_string(),
+                            repo: repo.trim().to_string(),
+                        }
                     }
                 } else {
-                    UpdateSource::GitHubReleases {
-                        owner: "PuppyTunnel".to_string(),
-                        repo: if target.is_empty() {
-                            "puppytunnel".to_string()
-                        } else {
-                            target.to_string()
-                        },
-                    }
+                    github_default()
                 }
             }
             "direct" => UpdateSource::DirectUrl(target.to_string()),
             _ => {
-                let base = if target.is_empty() {
-                    "https://updates.puppytunnel.vip"
+                if target.is_empty() || is_retired_update_host(target) {
+                    github_default()
                 } else {
-                    target
-                };
-                UpdateSource::MasterApi(base.to_string())
+                    UpdateSource::MasterApi(target.to_string())
+                }
             }
         }
     }
@@ -286,6 +297,70 @@ mod tests {
 
         let master = UpdateSource::from_config("master", "https://relay.puppytunnel.com");
         assert_eq!(master, UpdateSource::MasterApi("https://relay.puppytunnel.com".into()));
+    }
+
+    #[test]
+    fn test_default_source_is_github() {
+        let expected = UpdateSource::GitHubReleases {
+            owner: "novembahh".into(),
+            repo: "puppytunnelrblx".into(),
+        };
+        assert_eq!(UpdateSource::from_config("default", ""), expected);
+        assert_eq!(UpdateSource::from_config("github", ""), expected);
+        assert_eq!(UpdateSource::from_config("master", ""), expected);
+        assert_eq!(UpdateSource::from_config("github", "novembahh/puppytunnelrblx"), expected);
+    }
+
+    #[test]
+    fn test_retired_cloudflare_feed_migrates_to_github() {
+        let expected = UpdateSource::GitHubReleases {
+            owner: "novembahh".into(),
+            repo: "puppytunnelrblx".into(),
+        };
+        assert_eq!(
+            UpdateSource::from_config("master", "https://updates.puppytunnel.vip"),
+            expected
+        );
+        assert_eq!(
+            UpdateSource::from_config("master", "https://master.puppytunnel.com/api/updates/check?channel=beta"),
+            expected
+        );
+        let custom = UpdateSource::from_config("master", "https://updates.example.com");
+        assert_eq!(custom, UpdateSource::MasterApi("https://updates.example.com".into()));
+    }
+
+    #[test]
+    fn test_nightly_tag_parses_to_nightly_channel() {
+        let json = r#"[
+            {
+                "tag_name": "v1.0.0-nightly.42",
+                "name": "Nightly v1.0.0-nightly.42",
+                "body": "",
+                "prerelease": true,
+                "published_at": "2026-10-18T00:00:00Z",
+                "assets": [
+                    {
+                        "name": "PuppyTunnel-Windows-x86_64.exe",
+                        "browser_download_url": "https://github.com/novembahh/puppytunnelrblx/releases/download/v1.0.0-nightly.42/PuppyTunnel-Windows-x86_64.exe",
+                        "size": 7000000
+                    },
+                    {
+                        "name": "PuppyTunnel-Windows-x86_64.pdb",
+                        "browser_download_url": "https://github.com/novembahh/puppytunnelrblx/releases/download/v1.0.0-nightly.42/PuppyTunnel-Windows-x86_64.pdb",
+                        "size": 1700000
+                    }
+                ]
+            }
+        ]"#;
+
+        let parsed = parse_github_releases(json).unwrap();
+        assert_eq!(parsed.releases.len(), 1);
+        let rel = &parsed.releases[0];
+        assert_eq!(rel.channel, Channel::Nightly);
+        assert_eq!(rel.version, "1.0.0-nightly.42");
+        assert!(crate::update::manifest::is_newer("1.0.0-beta.2", &rel.version));
+        let asset = rel.find_asset_for_platform(&crate::update::manifest::Platform::WindowsX64).unwrap();
+        assert_eq!(asset.name, "PuppyTunnel-Windows-x86_64.exe");
     }
 
     #[test]

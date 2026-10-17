@@ -712,9 +712,9 @@ fn run_update_cli(
             config.update_source_type = "github".into();
             config.update_source_url = "".into();
             dirty = true;
-        } else if src == "default" || src == "master" {
-            config.update_source_type = "master".into();
-            config.update_source_url = "https://updates.puppytunnel.vip".into();
+        } else if src == "default" || src == "master" || src == "github" {
+            config.update_source_type = "github".into();
+            config.update_source_url = "".into();
             dirty = true;
         } else {
             eprintln!("[fail] Invalid source '{}'. Provide a URL or 'github' or 'default'.", src);

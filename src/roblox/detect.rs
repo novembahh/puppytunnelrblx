@@ -8,7 +8,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_RELAY: &str = "relay.puppytunnel.vip:7777";
-pub const DEFAULT_UPDATES: &str = "https://updates.puppytunnel.vip";
 pub const FALLBACK_UID: &str = "2721761670";
 
 
@@ -201,8 +200,18 @@ pub fn autoconfigure(config: &mut AppConfig) -> bool {
     }
 
 
-    if config.update_source_url.trim().is_empty() || config.update_source_url.contains("master.puppytunnel.com") {
-        config.update_source_url = DEFAULT_UPDATES.to_string();
+    if config.update_source_url.trim().is_empty()
+        || crate::update::source::is_retired_update_host(&config.update_source_url)
+    {
+        config.update_source_type = "github".to_string();
+        config.update_source_url = format!(
+            "{}/{}",
+            crate::update::source::DEFAULT_GITHUB_OWNER,
+            crate::update::source::DEFAULT_GITHUB_REPO
+        );
+        if config.update_channel.trim().eq_ignore_ascii_case("beta") {
+            config.update_channel = "nightly".to_string();
+        }
         changed = true;
     }
 
