@@ -1,0 +1,39 @@
+name: Nightly Release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Stage files
+        shell: bash
+        run: |
+          cp target/release/puppytunnel.exe PuppyTunnel-Windows-x86_64.exe
+          cp target/release/puppytunnel.pdb PuppyTunnel-Windows-x86_64.pdb
+
+      - name: Publish nightly release
+        uses: marvinpinto/action-automatic-releases@latest
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          automatic_release_tag: nightly
+          prerelease: true
+          title: Nightly Build
+          files: |
+            PuppyTunnel-Windows-x86_64.exe
+            PuppyTunnel-Windows-x86_64.pdb

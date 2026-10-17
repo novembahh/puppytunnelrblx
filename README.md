@@ -7,11 +7,11 @@
   [![Commit activity](https://img.shields.io/github/commit-activity/m/novembahh/puppytunnel?style=for-the-badge)](/../../commits/)
   [![Discord](https://img.shields.io/badge/DISCORD-join-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://dsc.gg/puppytunnel)
 
-  [![Download](.github/assets/download.svg)](https://nightly.link/novembahh/puppytunnel/workflows/build/master/PuppyTunnel-Windows-x86_64.zip)
-  [![PDB](.github/assets/pdb.svg)](https://nightly.link/novembahh/puppytunnel/workflows/build/master/PuppyTunnel-Windows-x86_64-PDB.zip)
+  [![Download](.github/assets/download.svg)](https://github.com/novembahh/puppytunnel/releases/download/nightly/PuppyTunnel-Windows-x86_64.exe)
+  [![PDB](.github/assets/pdb.svg)](https://github.com/novembahh/puppytunnel/releases/download/nightly/PuppyTunnel-Windows-x86_64.pdb)
   <br><br>
 
-  <sub>If nightly.link is down or can't be accessed, you can still download through [GitHub](https://github.com/novembahh/puppytunnel/actions) with an account.</sub>
+  <sub>Nightly build from latest master. You can also browse all files under [Releases](https://github.com/novembahh/puppytunnel/releases).</sub>
   <br><br>
 
 </div>
