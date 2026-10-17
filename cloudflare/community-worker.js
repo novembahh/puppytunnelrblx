@@ -59,13 +59,24 @@ async function getOrCreateUser(db, pubkey) {
   const now = nowSec();
   const shortId = pk.slice(0, 8);
   const isAdmin = pk === "d5a864d4363d596eeccb2e4b3ebadcc7eec5d36e2f1e29202a0a38096cf8f9bf" ? 1 : 0;
-  await db
-    .prepare(
-      `INSERT INTO users (pubkey, roblox_id, username, display_name, bio, accent, avatar_url, banner_url, created_at, updated_at, is_admin, roblox_verified)
-       VALUES (?, 0, ?, ?, '', '#5fe3ac', '', '', ?, ?, ?, 0)`
-    )
-    .bind(pk, `pup_${shortId}`, `Puppy ${shortId}`, now, now, isAdmin)
-    .run();
+  try {
+    await db
+      .prepare(
+        `INSERT INTO users (pubkey, roblox_id, username, display_name, bio, accent, avatar_url, banner_url, created_at, updated_at, is_admin, roblox_verified)
+         VALUES (?, 0, ?, ?, '', '#5fe3ac', '', '', ?, ?, ?, 0)`
+      )
+      .bind(pk, `pup_${shortId}`, `Puppy ${shortId}`, now, now, isAdmin)
+      .run();
+  } catch (e) {
+    if (!String((e && e.message) || e).includes("no column named")) throw e;
+    await db
+      .prepare(
+        `INSERT INTO users (pubkey, roblox_id, username, display_name, bio, accent, avatar_url, banner_url, created_at, updated_at, is_admin)
+         VALUES (?, 0, ?, ?, '', '#5fe3ac', '', '', ?, ?, ?)`
+      )
+      .bind(pk, `pup_${shortId}`, `Puppy ${shortId}`, now, now, isAdmin)
+      .run();
+  }
 
   user = await db.prepare("SELECT * FROM users WHERE pubkey = ?").bind(pk).first();
   return { ok: true, user };
