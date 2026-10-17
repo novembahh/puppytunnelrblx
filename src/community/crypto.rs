@@ -64,8 +64,16 @@ pub fn sign_envelope<T: Serialize>(
     action: &str,
     payload: T,
 ) -> Result<CommunityEnvelope<T>, CryptoError> {
+    sign_envelope_with_ts(id, action, payload, unix_now())
+}
+
+pub fn sign_envelope_with_ts<T: Serialize>(
+    id: &Identity,
+    action: &str,
+    payload: T,
+    ts: u64,
+) -> Result<CommunityEnvelope<T>, CryptoError> {
     let payload_hash = hash_payload(&payload)?;
-    let ts = unix_now();
     let nonce = Uuid::new_v4().to_string();
     let msg = signing_message(action, ts, &nonce, &payload_hash);
     let sig = id.sign(&msg);
@@ -148,6 +156,15 @@ mod tests {
             verify_envelope(&tampered_action, 60).unwrap_err(),
             CryptoError::SignatureInvalid
         );
+
+        let future = unix_now() + 3600;
+        let explicit = sign_envelope_with_ts(&id, "post:create", payload.clone(), future).unwrap();
+        assert_eq!(explicit.ts, future);
+        assert!(verify_envelope(&explicit, 7200).is_ok());
+        assert!(matches!(
+            verify_envelope(&explicit, 60),
+            Err(CryptoError::StaleTimestamp { .. })
+        ));
 
         let mut stale = envelope.clone();
         stale.ts = unix_now() - 3600;

@@ -55,11 +55,17 @@ impl PermissionFlags {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct Attachment {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub filename: String,
+    #[serde(default)]
     pub media_type: String,
+    #[serde(default)]
     pub url: String,
+    #[serde(default)]
     pub hash: String,
+    #[serde(default)]
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<u32>,

@@ -1,7 +1,7 @@
 use crate::community::crypto;
 use crate::community::federation::DEFAULT_INSTANCE;
 use crate::community::types::*;
-use crate::identity::{hex, Identity};
+use crate::identity::{hex, unix_now, Identity};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -159,6 +159,48 @@ pub struct CommunityClient {
     agent: ureq::Agent,
     pub cache: Arc<Mutex<CommunityCache>>,
     pub offline_mode: bool,
+    time_offset: Arc<Mutex<Option<i64>>>,
+}
+
+fn parse_http_date(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let day: i64 = parts[1].parse().ok()?;
+    let mon = match parts[2] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts[3].parse().ok()?;
+    let t: Vec<&str> = parts[4].split(':').collect();
+    if t.len() != 3 {
+        return None;
+    }
+    let hh: i64 = t[0].parse().ok()?;
+    let mm: i64 = t[1].parse().ok()?;
+    let ss: i64 = t[2].parse().ok()?;
+    if day < 1 || day > 31 || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let y = if mon <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (mon + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146097 + doe - 719468) * 86400 + hh * 3600 + mm * 60 + ss)
 }
 
 impl CommunityClient {
@@ -180,7 +222,60 @@ impl CommunityClient {
                 .build(),
             cache: Arc::new(Mutex::new(CommunityCache::default())),
             offline_mode: false,
+            time_offset: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn cached_offset(&self) -> i64 {
+        self.time_offset.lock().map(|g| g.unwrap_or(0)).unwrap_or(0)
+    }
+
+    fn signed_ts(&self) -> u64 {
+        let now = unix_now() as i64;
+        (now + self.cached_offset()).max(0) as u64
+    }
+
+    fn measure_offset(&self) -> Option<i64> {
+        let local = unix_now() as i64;
+        let resp = self.agent.head(&self.base_url).call().ok().or_else(|| {
+            self.agent
+                .get(&format!("{}/api/community", self.base_url))
+                .call()
+                .ok()
+        })?;
+        let date = resp.header("date")?;
+        Some(parse_http_date(date)? - local)
+    }
+
+    fn refresh_offset(&self) -> bool {
+        let prev = self.cached_offset();
+        match self.measure_offset() {
+            Some(off) if (off - prev).abs() > 30 => {
+                if let Ok(mut g) = self.time_offset.lock() {
+                    *g = Some(off);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn post_value(&self, url: &str, val: serde_json::Value) -> Result<serde_json::Value, String> {
+        let resp = self
+            .agent
+            .post(url)
+            .send_json(val)
+            .map_err(|e| match e {
+                ureq::Error::Status(c, r) => {
+                    let msg = r
+                        .into_json::<serde_json::Value>()
+                        .ok()
+                        .and_then(|v| v["error"].as_str().map(String::from));
+                    format!("server error {}{}", c, msg.map(|m| format!(": {}", m)).unwrap_or_default())
+                }
+                e => e.to_string(),
+            })?;
+        resp.into_json().map_err(|e| e.to_string())
     }
 
     pub fn set_offline(&mut self, offline: bool) {
@@ -201,36 +296,33 @@ impl CommunityClient {
             .ok_or_else(|| "profile identity required to sign community mutation".to_string())
     }
 
-    fn post_envelope<P: Serialize, R: for<'de> Deserialize<'de>>(
+    fn post_envelope<P: Serialize + Clone, R: for<'de> Deserialize<'de>>(
         &self,
         endpoint: &str,
         action: &str,
         payload: P,
     ) -> Result<R, String> {
         let id = self.require_identity()?;
-        let env = crypto::sign_envelope(id, action, payload)
-            .map_err(|e| format!("signing failed: {}", e))?;
 
         if self.offline_mode {
             return Err("cannot perform mutations in offline mode".to_string());
         }
 
         let url = format!("{}{}", self.base_url, endpoint);
-        let resp = self.agent
-            .post(&url)
-            .send_json(serde_json::to_value(&env).map_err(|e| e.to_string())?)
-            .map_err(|e| match e {
-                ureq::Error::Status(c, r) => {
-                    let msg = r
-                        .into_json::<serde_json::Value>()
-                        .ok()
-                        .and_then(|v| v["error"].as_str().map(String::from));
-                    format!("server error {}{}", c, msg.map(|m| format!(": {}", m)).unwrap_or_default())
+        let mut retried = false;
+        let val: serde_json::Value = loop {
+            let env = crypto::sign_envelope_with_ts(id, action, payload.clone(), self.signed_ts())
+                .map_err(|e| format!("signing failed: {}", e))?;
+            let body = serde_json::to_value(&env).map_err(|e| e.to_string())?;
+            match self.post_value(&url, body) {
+                Err(e) if !retried && e.starts_with("server error 401") && self.refresh_offset() => {
+                    retried = true;
+                    continue;
                 }
-                e => e.to_string(),
-            })?;
-
-        let val: serde_json::Value = resp.into_json().map_err(|e| e.to_string())?;
+                Err(e) => break Err(e),
+                Ok(v) => break Ok(v),
+            }
+        }?;
         if let Ok(direct) = serde_json::from_value::<R>(val.clone()) {
             return Ok(direct);
         }
