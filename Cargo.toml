@@ -4,6 +4,7 @@ version = "1.0.0-beta.2"
 edition = "2021"
 authors = ["PuppyTunnel"]
 description = "Host and join Roblox Studio sessions through a tunnel or private relay"
+license = "GPL-3.0-only"
 
 [features]
 default = ["gui"]
