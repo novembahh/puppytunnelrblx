@@ -1432,22 +1432,13 @@ impl NepApp {
                                 let desc: String = l.description.chars().take(140).collect();
                                 ui.label(muted(desc));
                             }
-                            if let Some((rh, rp, _)) = parse_invite(&l.invite) {
-                                let relay_hit = split_host_port(self.config.relay.trim())
-                                    .map(|(relay_host, relay_port)| {
-                                        relay_port == rp
-                                            && relay_host.trim().to_ascii_lowercase()
-                                                == rh.trim().to_ascii_lowercase()
-                                    })
-                                    .unwrap_or(false);
-                                if !relay_hit {
-                                    ui.horizontal(|ui| {
-                                        ui.label(muted(format!("{}:{}", rh, rp)));
-                                        if secondary_icon(ui, Icon::Copy, "copy server address") {
-                                            copy_text(&format!("{}:{}", rh, rp));
-                                        }
-                                    });
-                                }
+                            if parse_invite(&l.invite).is_some() {
+                                ui.horizontal(|ui| {
+                                    ui.label(muted("relay"));
+                                    if secondary_icon(ui, Icon::Copy, "copy invite") {
+                                        copy_text(&l.invite);
+                                    }
+                                });
                             }
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
