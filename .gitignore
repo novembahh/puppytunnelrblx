@@ -72,6 +72,8 @@ __tmp_*
 *.id2
 *.nam
 *.til
+*.idb
+*.i64
 
 # Headless module (local only, never committed)
 textmode/

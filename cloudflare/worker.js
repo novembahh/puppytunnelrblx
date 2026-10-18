@@ -110,6 +110,8 @@ export default {
         return json({ error: "Invalid channel '" + channel + "'. Supported: stable, beta, nightly" }, 400);
       }
 
+      const latestVersion = manifest.version;
+      const isNewer = !currVersion || compareSemver(latestVersion, currVersion) > 0;
       const platformKey = os + "-" + arch;
       const assetList = Array.isArray(manifest.assets) ? manifest.assets : (manifest.assets ? Object.values(manifest.assets) : []);
       const asset = (manifest.assets_map && manifest.assets_map[platformKey])
