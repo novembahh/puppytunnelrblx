@@ -228,8 +228,15 @@ pub fn get_config_path() -> PathBuf {
     get_script_dir().join(CONFIG_FILE)
 }
 
-pub fn get_session_log_path() -> PathBuf {
-    get_script_dir().join(LOG_FILE)
+pub fn session_log_name(port: &str) -> String {
+    match port.trim().parse::<u16>() {
+        Ok(p) => format!("SESSION_INFO_{}.txt", p),
+        Err(_) => LOG_FILE.to_string(),
+    }
+}
+
+pub fn get_session_log_path(port: &str) -> PathBuf {
+    get_script_dir().join(session_log_name(port))
 }
 
 pub fn get_join_log_path() -> PathBuf {
@@ -344,10 +351,17 @@ pub fn load_config() -> AppConfig {
     config
 }
 
+fn write_atomic(path: &std::path::Path, content: &[u8]) {
+    let tmp = path.with_extension("tmp");
+    if fs::write(&tmp, content).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
 pub fn save_config(config: &AppConfig) {
     let path = get_config_path();
     if let Ok(content) = serde_json::to_string_pretty(config) {
-        let _ = fs::write(path, content);
+        write_atomic(&path, content.as_bytes());
     }
 }
 
@@ -426,7 +440,7 @@ pub fn write_session_log(
     ];
 
     let content = lines.join("\n");
-    let _ = fs::write(get_session_log_path(), content);
+    write_atomic(&get_session_log_path(port), content.as_bytes());
 
     let clip_cmd = if cfg!(target_os = "linux") {
         &lin_cmd

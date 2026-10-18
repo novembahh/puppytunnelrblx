@@ -418,8 +418,8 @@ pub fn udp_port_bound(port: u16) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn udp_port_bound(_port: u16) -> bool {
-    true
+pub fn udp_port_bound(port: u16) -> bool {
+    super::udp_port_in_use(port)
 }
 
 

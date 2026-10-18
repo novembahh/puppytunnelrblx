@@ -8,7 +8,7 @@ use crate::identity::Identity;
 use crate::master::{self, Announce, RemoteServer};
 use crate::net::relay::{make_invite, parse_invite, run_host_agent};
 use crate::net::{
-    run_connectivity_test, run_echo_test, start_proxy, start_proxy_relay, warm_tunnel, EchoServer,
+    run_connectivity_test, run_echo_test, start_proxy, start_proxy_relay, udp_port_in_use, warm_tunnel, EchoServer,
     ProxyHandle,
 };
 use crate::privacy::tunnel_addr_warnings;
@@ -36,6 +36,8 @@ use std::time::{Duration, Instant};
 
 
 pub const CONTENT: f32 = 1040.0;
+
+pub const MAX_LOG_ENTRIES: usize = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Screen {
@@ -322,6 +324,10 @@ impl NepApp {
         move |msg: &str, tag: &str| {
             if let Ok(mut l) = logs.lock() {
                 l.push(LogEntry { time: ts(), message: msg.to_string(), tag: tag.to_string() });
+                if l.len() > MAX_LOG_ENTRIES {
+                    let drop = l.len() - MAX_LOG_ENTRIES;
+                    l.drain(..drop);
+                }
             }
         }
     }
@@ -365,6 +371,22 @@ impl NepApp {
 
     fn hosting(&self) -> bool {
         self.server_process.is_some()
+    }
+
+    fn poll_server_process(&mut self) {
+        let exited = match self.server_process.as_mut() {
+            Some(child) => match child.try_wait() {
+                Ok(Some(status)) => Some(format!("Studio server exited ({}). Relay stopped.", status)),
+                Err(e) => Some(format!("Studio server error ({}). Relay stopped.", e)),
+                Ok(None) => None,
+            },
+            None => None,
+        };
+        if let Some(msg) = exited {
+            self.add_log(&msg, "err");
+            self.stop_host_services();
+            self.screen = Screen::Host;
+        }
     }
 
     fn joined(&self) -> bool {
@@ -411,6 +433,7 @@ impl eframe::App for NepApp {
             self.stop_join_services();
             self.screen = Screen::Join;
         }
+        self.poll_server_process();
 
         self.community_state.local_headshot = self.headshot.clone();
         self.community_state.local_avatar = self.avatar_tex.clone();
@@ -1015,13 +1038,29 @@ impl NepApp {
         self.server_live = false;
         self.server_start_time = Some(Instant::now());
 
+        let studio_port: u16 = match self.config.port.trim().parse() {
+            Ok(p) => p,
+            Err(_) => {
+                self.add_log("Studio port is not a valid port number.", "err");
+                self.status_text = "Studio port is not a valid port number.".to_string();
+                return;
+            }
+        };
+        if udp_port_in_use(studio_port) {
+            self.add_log(&format!("Port {} is already in use (another server or app instance?). Stop it or change Studio port.", studio_port), "err");
+            self.status_text = format!("Port {} is already in use.", studio_port);
+            return;
+        }
+
         let pg = gen_guid();
         let tg = gen_guid();
         self.add_log(&format!("Port {}", self.config.port), "dim");
 
         if self.host_media {
-            let _ = self.boombox_server.start();
-            self.add_log("Media helper running on 127.0.0.1:48732", "info");
+            match self.boombox_server.start() {
+                Ok(()) => self.add_log("Media helper running on 127.0.0.1:48732", "info"),
+                Err(e) => self.add_log(&format!("Media helper unavailable ({}). Another instance may hold port 48732.", e), "warn"),
+            }
         }
 
         if !self.config.map.trim().is_empty() {
@@ -1037,6 +1076,7 @@ impl NepApp {
                 self.server_process = Some(child);
                 self.add_log("Studio server launched. Waiting for it to initialise.", "info");
                 let _ = write_session_log(&pg, &tg, &self.config.addr, &self.config.port, &self.config.uid);
+                self.add_log(&format!("Session log written to {}", crate::config::session_log_name(&self.config.port)), "dim");
                 self.start_relay_agent();
                 if self.invite.is_none() {
                     self.add_log("Join command copied to the clipboard.", "dim");

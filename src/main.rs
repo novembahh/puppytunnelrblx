@@ -15,7 +15,7 @@ pub mod ui;
 pub mod update;
 
 use clap::{Parser, Subcommand};
-use config::{load_config, save_config, split_host_port, ts, write_session_log, PROXY_PORT, RELAY_PORT};
+use config::{load_config, save_config, session_log_name, split_host_port, ts, write_session_log, PROXY_PORT, RELAY_PORT};
 use identity::Identity;
 use update::source::UpdateSourceFetcher;
 use net::relay::{make_invite, parse_invite, run_host_agent, RelayServer};
@@ -535,7 +535,7 @@ fn run_relay(listen: &str, with_master: Option<&str>, opts: master::MasterOption
 }
 
 fn port_free(port: u16) -> bool {
-    crate::net::bind_udp(std::net::SocketAddr::from(([127, 0, 0, 1], port)), true).is_ok()
+    !crate::net::udp_port_in_use(port)
 }
 
 fn run_doctor(args: &Cli) -> i32 {
@@ -1209,6 +1209,10 @@ fn run_host(config: &config::AppConfig, studio: &str, nep: bool, stop: &Arc<Atom
             return 2;
         }
     };
+    if crate::net::udp_port_in_use(studio_port) {
+        eprintln!("Port {} is already in use (another server or app instance?). Stop it or use a different port.", studio_port);
+        return 1;
+    }
     if studio.is_empty() {
         eprintln!("Roblox Studio not found. Set `studio` in puppytunnel.json.");
         return 1;
@@ -1335,7 +1339,7 @@ fn run_host(config: &config::AppConfig, studio: &str, nep: bool, stop: &Arc<Atom
     let code = match launch_server(studio, &config.port, &config.uid, &pg, &tg) {
         Ok(mut child) => {
             let _ = write_session_log(&pg, &tg, &config.addr, &config.port, &config.uid);
-            println!("[{}] Session log written to SESSION_INFO.txt", ts());
+            println!("[{}] Session log written to {}", ts(), session_log_name(&config.port));
             if let Some(inv) = &invite {
                 println!("[{}] Invite (share this; your IP stays hidden): {}", ts(), inv);
                 config::copy_text(inv);
