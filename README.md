@@ -22,3 +22,15 @@
 
 Host and join Roblox Studio sessions through a tunnel or private relay.
 A better & open-source alternative to neptunnel!
+
+### Hosting a server yourself?
+
+textmode is a tiny optional DLL that makes Studio barely render anything,
+so a hosted server uses way less CPU. You do not need it to play, only the
+box running the server does.
+
+[Download textmode-d3d11.dll](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/textmode-d3d11.dll)
+from nightly, drop it next to RobloxStudioBeta.exe and launch with
+WINEDLLOVERRIDES=d3d11=n,b. Full details in [textmode/](textmode/).
+
+Found a bug? Report it on https://github.com/novembahh/puppytunnelrblx/issues/

@@ -21,11 +21,22 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
+      - name: Install MinGW
+        run: choco install mingw -y --no-progress
+
+      - name: Build textmode headless module
+        shell: bash
+        run: |
+          cd textmode
+          mkdir -p dist
+          gcc -O2 -Wall -shared -o dist/d3d11.dll src/proxy.c -DPROXY_D3D11 src/proxy-d3d11.def -Wl,--subsystem,windows
+
       - name: Stage files
         shell: bash
         run: |
           cp target/release/puppytunnel.exe PuppyTunnel-Windows-x86_64.exe
           cp target/release/puppytunnel.pdb PuppyTunnel-Windows-x86_64.pdb
+          cp textmode/dist/d3d11.dll textmode-d3d11.dll
 
       - name: Publish nightly release
         uses: marvinpinto/action-automatic-releases@latest
@@ -37,6 +48,7 @@ jobs:
           files: |
             PuppyTunnel-Windows-x86_64.exe
             PuppyTunnel-Windows-x86_64.pdb
+            textmode-d3d11.dll
 
       - name: Publish versioned nightly
         uses: softprops/action-gh-release@v2
@@ -48,3 +60,4 @@ jobs:
           files: |
             PuppyTunnel-Windows-x86_64.exe
             PuppyTunnel-Windows-x86_64.pdb
+            textmode-d3d11.dll
