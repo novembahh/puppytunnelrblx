@@ -9,6 +9,7 @@
 
   [![Download](.github/assets/download.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/PuppyTunnel-Windows-x86_64.exe)
   [![PDB](.github/assets/pdb.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/PuppyTunnel-Windows-x86_64.pdb)
+  [![Textmode](.github/assets/textmode.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/textmode-d3d11.dll)
   <br><br>
 
   <sub>Nightly build from latest master. You can also browse all files under [Releases](https://github.com/novembahh/puppytunnelrblx/releases).</sub>
@@ -29,8 +30,7 @@ textmode is a tiny optional DLL that makes Studio barely render anything,
 so a hosted server uses way less CPU. You do not need it to play, only the
 box running the server does.
 
-[Download textmode-d3d11.dll](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/textmode-d3d11.dll)
-from nightly, drop it next to RobloxStudioBeta.exe and launch with
-WINEDLLOVERRIDES=d3d11=n,b. Full details in [textmode/](textmode/).
+Grab it with the Textmode button above, drop it next to RobloxStudioBeta.exe
+and launch with WINEDLLOVERRIDES=d3d11=n,b. Full details in [textmode/](textmode/).
 
 Found a bug? Report it on https://github.com/novembahh/puppytunnelrblx/issues/
