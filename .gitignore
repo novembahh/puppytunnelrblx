@@ -72,3 +72,7 @@ __tmp_*
 *.id2
 *.nam
 *.til
+
+# Headless module (local only, never committed)
+textmode/
+.github/assets/textmode.svg

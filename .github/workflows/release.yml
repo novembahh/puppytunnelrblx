@@ -21,22 +21,11 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
-      - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Build textmode headless module
-        shell: cmd
-        run: |
-          if not exist textmode\dist mkdir textmode\dist
-          cl /nologo /O2 /LD /Zi textmode\src\proxy.c /DPROXY_D3D11 /link /DEF:textmode\src\proxy-d3d11.def /OUT:textmode\dist\d3d11.dll /PDB:textmode\dist\d3d11.pdb
-
       - name: Stage files
         shell: bash
         run: |
           cp target/release/puppytunnel.exe PuppyTunnel-Windows-x86_64.exe
           cp target/release/puppytunnel.pdb PuppyTunnel-Windows-x86_64.pdb
-          cp textmode/dist/d3d11.dll textmode-d3d11.dll
-          cp textmode/dist/d3d11.pdb textmode-d3d11.pdb
 
       - name: Publish nightly release
         uses: marvinpinto/action-automatic-releases@latest
@@ -48,8 +37,6 @@ jobs:
           files: |
             PuppyTunnel-Windows-x86_64.exe
             PuppyTunnel-Windows-x86_64.pdb
-            textmode-d3d11.dll
-            textmode-d3d11.pdb
 
       - name: Publish versioned nightly
         uses: softprops/action-gh-release@v2
@@ -61,5 +48,3 @@ jobs:
           files: |
             PuppyTunnel-Windows-x86_64.exe
             PuppyTunnel-Windows-x86_64.pdb
-            textmode-d3d11.dll
-            textmode-d3d11.pdb

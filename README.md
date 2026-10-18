@@ -9,8 +9,6 @@
 
   [![Download](.github/assets/download.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/PuppyTunnel-Windows-x86_64.exe)
   [![PDB](.github/assets/pdb.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/PuppyTunnel-Windows-x86_64.pdb)
-  [![Textmode](.github/assets/textmode.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/textmode-d3d11.dll)
-  [![PDB](.github/assets/pdb.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/textmode-d3d11.pdb)
   <br><br>
 
   <sub>Nightly build from latest master. You can also browse all files under [Releases](https://github.com/novembahh/puppytunnelrblx/releases).</sub>
@@ -24,15 +22,3 @@
 
 Host and join Roblox Studio sessions through a tunnel or private relay.
 A better & open-source alternative to neptunnel!
-
-### Hosting a server yourself?
-
-textmode is a tiny optional DLL that makes Studio barely render anything,
-so a hosted server uses way less CPU. You do not need it to play, only the
-box running the server does.
-
-Grab it with the Textmode button above and drop it next to RobloxStudioBeta.exe.
-On Wine launch with WINEDLLOVERRIDES=d3d11=n,b, on Windows just run as usual.
-Full details in [textmode/](textmode/).
-
-Found a bug? Report it on https://github.com/novembahh/puppytunnelrblx/issues/
