@@ -105,6 +105,8 @@ enum Cmd {
         #[arg(long)]
         with_master: Option<String>,
         #[arg(long)]
+        strict_profiles: bool,
+        #[arg(long)]
         trust_proxy: bool,
         #[arg(long)]
         peer: Vec<String>,
@@ -114,6 +116,8 @@ enum Cmd {
         data_dir: Option<PathBuf>,
     },
     Master {
+        #[arg(long)]
+        strict_profiles: bool,
         #[arg(long, default_value = "0.0.0.0:8080")]
         listen: String,
         #[arg(long)]
@@ -265,11 +269,11 @@ fn main() {
     if let Some(cmd) = args.cmd.take() {
         headless = true;
         match cmd {
-            Cmd::Relay { listen, with_master, trust_proxy, peer, allow_private_relays, data_dir } => {
-                relay_listen = Some((listen, with_master, master::MasterOptions { trust_proxy, peers: peer, allow_private_relays, roblox_api: None, persist_profiles_cache: true, data_dir: data_dir.clone(), ..Default::default() }))
+            Cmd::Relay { listen, with_master, trust_proxy, peer, allow_private_relays, data_dir, strict_profiles } => {
+                relay_listen = Some((listen, with_master, master::MasterOptions { trust_proxy, peers: peer, allow_private_relays, strict_profiles, roblox_api: None, persist_profiles_cache: true, data_dir: data_dir.clone(), ..Default::default() }))
             }
-            Cmd::Master { listen, trust_proxy, peer, allow_private_relays, data_dir } => {
-                master_cmd = Some((listen, master::MasterOptions { trust_proxy, peers: peer, allow_private_relays, roblox_api: None, persist_profiles_cache: true, data_dir: data_dir.clone(), ..Default::default() }))
+            Cmd::Master { listen, trust_proxy, peer, allow_private_relays, data_dir, strict_profiles } => {
+                master_cmd = Some((listen, master::MasterOptions { trust_proxy, peers: peer, allow_private_relays, strict_profiles, roblox_api: None, persist_profiles_cache: true, data_dir: data_dir.clone(), ..Default::default() }))
             }
             Cmd::Browse { query, tag, sort } => browse = Some((query, tag, sort)),
             Cmd::Fleet { count, stagger } => fleet = Some((count, stagger)),
@@ -1286,6 +1290,9 @@ fn run_host(config: &config::AppConfig, studio: &str, nep: bool, stop: &Arc<Atom
                 max_players: config.max_players,
                 invite: inv.clone(),
                 version: "beta 1.0".to_string(),
+                console_policy: if config.console_allowed.trim().is_empty() { None } else { Some(config.console_allowed.trim().to_string()) },
+                overhead_tags: if config.overhead_tags { None } else { Some(false) },
+                strict_profiles: if config.strict_profiles { Some(true) } else { None },
                 host,
                 host_sig,
                 ts: 0,

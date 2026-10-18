@@ -67,6 +67,12 @@ pub struct Announce {
     pub host: String,
     #[serde(default)]
     pub host_sig: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_tags: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_profiles: Option<bool>,
     #[serde(default)]
     pub ts: u64,
 }
@@ -122,6 +128,12 @@ pub struct Listing {
     pub tags: Vec<String>,
     #[serde(default)]
     pub players: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overhead_tags: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_profiles: Option<bool>,
     #[serde(default)]
     pub max_players: u32,
     pub invite: String,
@@ -139,6 +151,9 @@ pub struct RemoteServer {
     pub listing: Listing,
 }
 
+pub fn strict_profile_ok(display_name: &str) -> bool {
+    !display_name.trim().is_empty()
+}
 fn clean(s: &str, max: usize) -> String {
     s.chars().filter(|c| !c.is_control()).take(max).collect::<String>().trim().to_string()
 }
@@ -173,6 +188,9 @@ fn to_listing(a: &Announce) -> Result<Listing, &'static str> {
         max_players: a.max_players.min(1000),
         invite: a.invite.clone(),
         version: clean(&a.version, 16),
+        console_policy: a.console_policy.clone(),
+        overhead_tags: a.overhead_tags,
+        strict_profiles: a.strict_profiles,
     })
 }
 
@@ -653,6 +671,7 @@ pub struct MasterOptions {
     pub instance_identity: Option<Identity>,
     pub persist_profiles_cache: bool,
     pub data_dir: Option<std::path::PathBuf>,
+    pub strict_profiles: bool,
 }
 
 #[derive(Clone)]
@@ -663,6 +682,7 @@ struct Ctx {
     allow_private: bool,
     persist_profiles: bool,
     data_dir: std::path::PathBuf,
+    strict_profiles: bool,
 }
 
 pub struct MasterServer {
@@ -705,6 +725,7 @@ impl MasterServer {
             allow_private: opts.allow_private_relays,
             roblox: opts.roblox_api.clone().unwrap_or_else(|| rbxapi::USERS_API.to_string()),
             persist_profiles: opts.persist_profiles_cache,
+            strict_profiles: opts.strict_profiles,
             data_dir,
         };
         for signed in stored_profiles {
@@ -2401,6 +2422,9 @@ fn ingest_profile(ctx: &Ctx, mut signed: SignedProfile, ip: &str) -> Result<Stri
         accent: profile::clean_accent(&signed.body.accent),
         ts: signed.body.ts,
     };
+    if ctx.strict_profiles && !strict_profile_ok(&sanitized.display_name) {
+        return Err((400, "display name is required"));
+    }
     signed.body = sanitized;
 
     let mut st = ctx.state.lock().unwrap();
@@ -2795,6 +2819,38 @@ mod tests {
     }
 
     #[test]
+    fn strict_profile_names_gated() {
+        let id = Identity::profile("test-secret");
+        let mk = |display_name: &str| SignedProfile::sign(&id, profile::ProfileBody { roblox_id: 7, display_name: display_name.into(), bio: "hi".into(), accent: "mint".into(), ts: 0 });
+        let ctx = |strict: bool| Ctx { roblox: String::new(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::path::PathBuf::new(), strict_profiles: strict };
+        assert!(ingest_profile(&ctx(false), mk("   "), "127.0.0.1").is_ok());
+        assert_eq!(ingest_profile(&ctx(true), mk("   "), "127.0.0.1"), Err((400, "display name is required")));
+        assert!(ingest_profile(&ctx(true), mk("Somebody"), "127.0.0.1").is_ok());
+        assert!(strict_profile_ok("Somebody"));
+        assert!(!strict_profile_ok("   "));
+    }
+
+    #[test]
+    fn announce_option_fields_round_trip() {
+        let relay_port = free_udp();
+        let mut relay_srv = RelayServer::start(([127, 0, 0, 1], relay_port).into(), |_| {}).unwrap();
+        let host = live_host(relay_port);
+        let master = "http://127.0.0.1:48999";
+        let _m = MasterServer::start("127.0.0.1:48999", opts()).unwrap();
+        let mut gated = body("Gated", &host.invite);
+        gated.strict_profiles = Some(true);
+        gated.overhead_tags = Some(false);
+        gated.console_policy = Some("123,456".into());
+        post_signed(master, &SignedAnnounce::sign(&host.id, gated)).unwrap();
+        assert!(wait_for(master, |l| l.len() == 1), "gated listing never appeared");
+        let l = fetch_one(master, "", "", "name", false).unwrap();
+        assert_eq!(l[0].listing.strict_profiles, Some(true));
+        assert_eq!(l[0].listing.overhead_tags, Some(false));
+        assert_eq!(l[0].listing.console_policy.as_deref(), Some("123,456"));
+        relay_srv.stop();
+    }
+
+    #[test]
     fn default_master() {
         assert_eq!(master_list(""), vec![DEFAULT_MASTER.to_string()]);
         assert_eq!(master_list("a.example, https://b.example/"), vec!["https://a.example", "https://b.example"]);
@@ -2878,7 +2934,7 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(errs.len(), 1);
 
-        let ctx = Ctx { roblox: rbxapi::USERS_API.to_string(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::env::temp_dir() };
+        let ctx = Ctx { roblox: rbxapi::USERS_API.to_string(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::env::temp_dir(), strict_profiles: false };
         let mut forged = SignedAnnounce::sign(&host.id, body("Legit", &host.invite));
         forged.body.description = "send me your password".into();
         assert!(ingest(&ctx, forged, "", true).is_err());

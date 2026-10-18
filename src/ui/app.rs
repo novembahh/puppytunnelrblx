@@ -991,6 +991,9 @@ impl NepApp {
                     field(ui, "Master servers", &mut self.config.master, "roblox.puppytunnel.vip (comma-separate several)");
                     ui.label(muted("Max players"));
                     ui.add(egui::DragValue::new(&mut self.config.max_players).range(0..=1000));
+                    toggle(ui, &mut self.config.overhead_tags, "Show overhead name tags");
+                    toggle(ui, &mut self.config.strict_profiles, "Require profile names");
+                    field(ui, "Console-approved IDs", &mut self.config.console_allowed, "123, 456 (empty allows all)");
                 }
             });
 
@@ -1089,6 +1092,9 @@ impl NepApp {
                 max_players: self.config.max_players,
                 invite: invite.clone(),
                 version: "beta 1.0".to_string(),
+                console_policy: if self.config.console_allowed.trim().is_empty() { None } else { Some(self.config.console_allowed.trim().to_string()) },
+                overhead_tags: if self.config.overhead_tags { None } else { Some(false) },
+                strict_profiles: if self.config.strict_profiles { Some(true) } else { None },
                 host,
                 host_sig,
                 ts: 0,

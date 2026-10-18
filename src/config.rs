@@ -119,6 +119,12 @@ pub struct AppConfig {
     pub update_history: Vec<UpdateHistoryEntry>,
     #[serde(default)]
     pub community_instance: String,
+    #[serde(default)]
+    pub console_allowed: String,
+    #[serde(default = "default_true")]
+    pub overhead_tags: bool,
+    #[serde(default)]
+    pub strict_profiles: bool,
 }
 
 fn default_channel() -> String {
@@ -171,11 +177,21 @@ impl Default for AppConfig {
                 status: "installed".to_string(),
             }],
             community_instance: String::new(),
+            console_allowed: String::new(),
+            overhead_tags: true,
+            strict_profiles: false,
         }
     }
 }
 
 impl AppConfig {
+    pub fn console_allowed_ids(&self) -> Vec<u64> {
+        self.console_allowed.split(',').filter_map(|s| s.trim().parse().ok()).collect()
+    }
+    pub fn console_allowed_for(&self, id: u64) -> bool {
+        let ids = self.console_allowed_ids();
+        ids.is_empty() || ids.contains(&id)
+    }
     pub fn community_base(&self) -> String {
         let own = self.community_instance.trim();
         if !own.is_empty() {
@@ -247,6 +263,7 @@ pub fn load_config() -> AppConfig {
             for (key, field) in [
                 ("master", &mut config.master),
                 ("community_instance", &mut config.community_instance),
+                ("console_allowed", &mut config.console_allowed),
                 ("server_name", &mut config.server_name),
                 ("server_desc", &mut config.server_desc),
                 ("server_tags", &mut config.server_tags),
@@ -275,6 +292,12 @@ pub fn load_config() -> AppConfig {
             }
             if let Some(v) = parsed.get("list_public").and_then(|v| v.as_bool()) {
                 config.list_public = v;
+            }
+            if let Some(v) = parsed.get("overhead_tags").and_then(|v| v.as_bool()) {
+                config.overhead_tags = v;
+            }
+            if let Some(v) = parsed.get("strict_profiles").and_then(|v| v.as_bool()) {
+                config.strict_profiles = v;
             }
             if let Some(v) = parsed.get("native_dialogs").and_then(|v| v.as_bool()) {
                 config.native_dialogs = v;
@@ -465,6 +488,19 @@ mod tests {
         assert_eq!(decoded.update_source_url, "PuppyTunnel/puppytunnel");
         assert_eq!(decoded.update_history.len(), 2);
         assert_eq!(decoded.update_history[1].version, "1.0.1");
+    }
+
+    #[test]
+    fn test_console_approvals_and_server_options() {
+        let config = AppConfig::default();
+        assert!(config.console_allowed_for(1));
+        assert!(config.overhead_tags);
+        assert!(!config.strict_profiles);
+        let mut gated = AppConfig::default();
+        gated.console_allowed = "12, bad, 34".to_string();
+        assert_eq!(gated.console_allowed_ids(), vec![12, 34]);
+        assert!(gated.console_allowed_for(12));
+        assert!(!gated.console_allowed_for(99));
     }
 
     #[test]

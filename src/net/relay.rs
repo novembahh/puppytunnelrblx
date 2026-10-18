@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,76 @@ impl FloodGate {
         }
         self.count += 1;
         true
+    }
+}
+
+const BIND_TTL_SECS: u64 = 60;
+const BIND_CHALLENGE_TTL_SECS: u64 = 300;
+
+pub struct BindRecord {
+    pub addr: SocketAddr,
+    pub first_seen: Instant,
+    pub last_seen: Instant,
+    pub challenge: String,
+    pub verified: bool,
+}
+
+pub struct BindRegistry {
+    binds: HashMap<Token, HashMap<SocketAddr, BindRecord>>,
+    challenges: HashMap<String, (Token, SocketAddr, Instant)>,
+}
+
+impl BindRegistry {
+    pub fn new() -> Self {
+        Self { binds: HashMap::new(), challenges: HashMap::new() }
+    }
+    pub fn hello(&mut self, token: Token, addr: SocketAddr) -> String {
+        let now = Instant::now();
+        let entry = self.binds.entry(token).or_default();
+        if let Some(r) = entry.get_mut(&addr) {
+            r.last_seen = now;
+            self.challenges.insert(r.challenge.clone(), (token, addr, now));
+            return r.challenge.clone();
+        }
+        let challenge = token_hex(&new_token());
+        entry.insert(addr, BindRecord { addr, first_seen: now, last_seen: now, challenge: challenge.clone(), verified: false });
+        self.challenges.insert(challenge.clone(), (token, addr, now));
+        challenge
+    }
+    pub fn confirm(&mut self, challenge: &str) -> bool {
+        let Some((token, addr, issued)) = self.challenges.remove(challenge) else { return false; };
+        if issued.elapsed() > Duration::from_secs(BIND_CHALLENGE_TTL_SECS) {
+            return false;
+        }
+        if let Some(r) = self.binds.get_mut(&token).and_then(|m| m.get_mut(&addr)) {
+            r.verified = true;
+            return true;
+        }
+        false
+    }
+    pub fn bindings(&self, token: &Token) -> Vec<SocketAddr> {
+        self.binds.get(token).map(|m| m.keys().copied().collect()).unwrap_or_default()
+    }
+    pub fn remove(&mut self, token: &Token, addr: &SocketAddr) {
+        if let Some(m) = self.binds.get_mut(token) {
+            m.remove(addr);
+            if m.is_empty() {
+                self.binds.remove(token);
+            }
+        }
+    }
+    pub fn prune(&mut self) {
+        self.binds.retain(|_, m| {
+            m.retain(|_, r| r.last_seen.elapsed() < Duration::from_secs(BIND_TTL_SECS));
+            !m.is_empty()
+        });
+        self.challenges.retain(|_, (_, _, t)| t.elapsed() < Duration::from_secs(BIND_CHALLENGE_TTL_SECS));
+    }
+}
+
+impl Default for BindRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -119,6 +189,7 @@ struct ClientEntry {
 pub struct RelayServer {
     running: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    binds: Arc<Mutex<BindRegistry>>,
 }
 
 impl RelayServer {
@@ -131,6 +202,8 @@ impl RelayServer {
         let running = Arc::new(AtomicBool::new(true));
         let run = Arc::clone(&running);
 
+        let binds = Arc::new(Mutex::new(BindRegistry::new()));
+        let thread_binds = Arc::clone(&binds);
         let thread = thread::spawn(move || {
             let mut hosts: HashMap<Token, (SocketAddr, Instant)> = HashMap::new();
             let mut clients: HashMap<SocketAddr, ClientEntry> = HashMap::new();
@@ -148,6 +221,7 @@ impl RelayServer {
                     clients.retain(|_, c| c.last.elapsed() < CLIENT_TTL);
                     cids.retain(|_, a| clients.contains_key(a));
                     client_gates.retain(|a, _| clients.contains_key(a));
+                    thread_binds.lock().unwrap().prune();
                     host_gates.retain(|_, g| g.start.elapsed() < Duration::from_secs(10));
                 }
 
@@ -221,6 +295,7 @@ impl RelayServer {
                             c.token = token;
                             c.last = Instant::now();
                         }
+                        thread_binds.lock().unwrap().hello(token, src);
                         let _ = sock.send_to(&frame(T_ACK_CLIENT, &[]), src);
                     }
                     T_BYE if body.len() == 16 => {
@@ -230,6 +305,7 @@ impl RelayServer {
                         clients.retain(|addr, c| !(addr == &src && c.token == token));
                         if clients.len() != before {
                             cids.retain(|_, a| clients.contains_key(a));
+                            thread_binds.lock().unwrap().remove(&token, &src);
                             log(&format!("client left from {}", src));
                         }
                     }
@@ -281,9 +357,12 @@ impl RelayServer {
             }
         });
 
-        Ok(Self { running, thread: Some(thread) })
+        Ok(Self { running, thread: Some(thread), binds })
     }
 
+    pub fn client_bindings(&self, token: &Token) -> Vec<SocketAddr> {
+        self.binds.lock().unwrap().bindings(token)
+    }
     pub fn stop(&mut self) {
         if self.running.swap(false, Ordering::SeqCst) {
             if let Some(t) = self.thread.take() {
@@ -505,6 +584,49 @@ mod tests {
         assert!(!g.allow(MAX_FORWARD_PER_SEC));
         g.start = Instant::now() - Duration::from_secs(2);
         assert!(g.allow(MAX_FORWARD_PER_SEC));
+    }
+
+    #[test]
+    fn bind_challenge_single_use() {
+        let mut r = BindRegistry::new();
+        let t = new_token();
+        let addr: SocketAddr = ([127, 0, 0, 1], 9).into();
+        let c = r.hello(t, addr);
+        assert!(!c.is_empty());
+        assert_eq!(r.bindings(&t), vec![addr]);
+        assert!(r.confirm(&c));
+        assert!(!r.confirm(&c));
+        assert!(!r.confirm("missing"));
+    }
+
+    #[test]
+    fn hello_records_client_binding() {
+        let relay_port = free_port();
+        let relay_addr: SocketAddr = ([127, 0, 0, 1], relay_port).into();
+        let mut relay = RelayServer::start(relay_addr, |_| {}).unwrap();
+        let host = Identity::ephemeral();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let ts = unix_now();
+        let mut reg = host.public().to_vec();
+        reg.extend_from_slice(&ts.to_be_bytes());
+        reg.extend_from_slice(&host.sign(&reg_message(ts)));
+        sock.send_to(&frame(T_REG, &reg), relay_addr).unwrap();
+        let mut b = [0u8; 64];
+        assert!(sock.recv(&mut b).is_ok());
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.send_to(&frame(T_HELLO, &host.token()), relay_addr).unwrap();
+        let want = client.local_addr().unwrap().port();
+        let mut seen = false;
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(50));
+            if relay.client_bindings(&host.token()).iter().any(|a| a.port() == want) {
+                seen = true;
+                break;
+            }
+        }
+        assert!(seen, "hello did not record a client binding");
+        relay.stop();
     }
 
     fn free_port() -> u16 {
