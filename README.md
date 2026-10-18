@@ -30,7 +30,8 @@ textmode is a tiny optional DLL that makes Studio barely render anything,
 so a hosted server uses way less CPU. You do not need it to play, only the
 box running the server does.
 
-Grab it with the Textmode button above, drop it next to RobloxStudioBeta.exe
-and launch with WINEDLLOVERRIDES=d3d11=n,b. Full details in [textmode/](textmode/).
+Grab it with the Textmode button above and drop it next to RobloxStudioBeta.exe.
+On Wine launch with WINEDLLOVERRIDES=d3d11=n,b, on Windows just run as usual.
+Full details in [textmode/](textmode/).
 
 Found a bug? Report it on https://github.com/novembahh/puppytunnelrblx/issues/
