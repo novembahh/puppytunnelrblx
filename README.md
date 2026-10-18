@@ -10,6 +10,7 @@
   [![Download](.github/assets/download.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/PuppyTunnel-Windows-x86_64.exe)
   [![PDB](.github/assets/pdb.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/PuppyTunnel-Windows-x86_64.pdb)
   [![Textmode](.github/assets/textmode.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/textmode-d3d11.dll)
+  [![PDB](.github/assets/pdb.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/textmode-d3d11.pdb)
   <br><br>
 
   <sub>Nightly build from latest master. You can also browse all files under [Releases](https://github.com/novembahh/puppytunnelrblx/releases).</sub>

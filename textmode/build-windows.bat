@@ -10,5 +10,5 @@ if errorlevel 1 (
 )
 cl /nologo /O2 /LD src\textmode.c /link /OUT:dist\textmode.dll
 cl /nologo /O2 src\tm_inject.c /link /OUT:dist\tm_inject.exe
-cl /nologo /O2 /LD src\proxy.c /DPROXY_D3D11 /link /DEF:src\proxy-d3d11.def /OUT:dist\d3d11.dll
+cl /nologo /O2 /LD /Zi src\proxy.c /DPROXY_D3D11 /link /DEF:src\proxy-d3d11.def /OUT:dist\d3d11.dll /PDB:dist\d3d11.pdb
 echo OK

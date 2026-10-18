@@ -42,7 +42,8 @@ build-windows.bat
 ```
 
 The same PE runs under Wine and on Windows, so most hosters just grab
-`textmode-d3d11.dll` from nightly instead of building.
+`textmode-d3d11.dll` from nightly instead of building. Nightly also ships
+the matching `textmode-d3d11.pdb` for debugging.
 
 ## Host wiring (Wine/Linux)
 
