@@ -1433,12 +1433,21 @@ impl NepApp {
                                 ui.label(muted(desc));
                             }
                             if let Some((rh, rp, _)) = parse_invite(&l.invite) {
-                                ui.horizontal(|ui| {
-                                    ui.label(muted(format!("{}:{}", rh, rp)));
-                                    if secondary_icon(ui, Icon::Copy, "copy server address") {
-                                        copy_text(&format!("{}:{}", rh, rp));
-                                    }
-                                });
+                                let relay_hit = split_host_port(self.config.relay.trim())
+                                    .map(|(relay_host, relay_port)| {
+                                        relay_port == rp
+                                            && relay_host.trim().to_ascii_lowercase()
+                                                == rh.trim().to_ascii_lowercase()
+                                    })
+                                    .unwrap_or(false);
+                                if !relay_hit {
+                                    ui.horizontal(|ui| {
+                                        ui.label(muted(format!("{}:{}", rh, rp)));
+                                        if secondary_icon(ui, Icon::Copy, "copy server address") {
+                                            copy_text(&format!("{}:{}", rh, rp));
+                                        }
+                                    });
+                                }
                             }
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
