@@ -122,11 +122,15 @@ pub fn profile_identity(config: &AppConfig) -> Identity {
     Identity::profile(&config.server_secret)
 }
 
+pub fn sanitize_text(s: &str, max: usize) -> String {
+    s.chars().filter(|c| !c.is_control()).take(max).collect::<String>().trim().to_string()
+}
+
 pub fn body_from_config(config: &AppConfig) -> ProfileBody {
     ProfileBody {
         roblox_id: config.roblox_id,
-        display_name: config.display_name.trim().chars().take(40).collect(),
-        bio: config.profile_bio.clone(),
+        display_name: sanitize_text(&config.display_name, 40),
+        bio: sanitize_text(&config.profile_bio, 200),
         accent: clean_accent(&config.profile_accent),
         ts: 0,
     }
@@ -198,6 +202,9 @@ mod tests {
         assert!(t.verify(60).is_err());
         assert_ne!(verify_code(&p.pubkey, 1), verify_code(&p.pubkey, 2));
         assert_ne!(verify_code(&p.pubkey, 1), verify_code("other", 1));
+        assert_eq!(sanitize_text("a\x00b\x07c", 10), "abc");
+        assert_eq!(sanitize_text("  hi  ", 10), "hi");
+        assert_eq!(sanitize_text("abcdef", 3), "abc");
         assert_eq!(clean_accent("nope"), "#5fe3ac");
         assert_eq!(clean_accent("#AABBCC"), "#aabbcc");
     }

@@ -27,6 +27,31 @@ const CLIENT_TTL: Duration = Duration::from_secs(30);
 const REG_MAX_SKEW_SECS: u64 = 300;
 const MAX_CLIENTS: usize = 1024;
 const MAX_HOSTS: usize = 256;
+const MAX_FORWARD_PER_SEC: u32 = 120;
+const MAX_FORWARD_BYTES: usize = 8192;
+
+pub fn forward_payload_ok(len: usize) -> bool {
+    len <= MAX_FORWARD_BYTES
+}
+
+struct FloodGate {
+    start: Instant,
+    count: u32,
+}
+
+impl FloodGate {
+    fn allow(&mut self, limit: u32) -> bool {
+        if self.start.elapsed() >= Duration::from_secs(1) {
+            self.start = Instant::now();
+            self.count = 0;
+        }
+        if self.count >= limit {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
 
 pub type Token = [u8; 16];
 
@@ -110,6 +135,8 @@ impl RelayServer {
             let mut hosts: HashMap<Token, (SocketAddr, Instant)> = HashMap::new();
             let mut clients: HashMap<SocketAddr, ClientEntry> = HashMap::new();
             let mut cids: HashMap<u32, SocketAddr> = HashMap::new();
+            let mut client_gates: HashMap<SocketAddr, FloodGate> = HashMap::new();
+            let mut host_gates: HashMap<SocketAddr, FloodGate> = HashMap::new();
             let mut next_cid: u32 = 1;
             let mut last_prune = Instant::now();
             let mut buf = vec![0u8; 65536];
@@ -120,6 +147,8 @@ impl RelayServer {
                     hosts.retain(|_, (_, t)| t.elapsed() < HOST_TTL);
                     clients.retain(|_, c| c.last.elapsed() < CLIENT_TTL);
                     cids.retain(|_, a| clients.contains_key(a));
+                    client_gates.retain(|a, _| clients.contains_key(a));
+                    host_gates.retain(|_, g| g.start.elapsed() < Duration::from_secs(10));
                 }
 
                 let (n, src) = match sock.recv_from(&mut buf) {
@@ -205,6 +234,16 @@ impl RelayServer {
                         }
                     }
                     T_C_DATA => {
+                        if !forward_payload_ok(body.len()) {
+                            continue;
+                        }
+                        let gate_ok = client_gates
+                            .entry(src)
+                            .or_insert(FloodGate { start: Instant::now(), count: 0 })
+                            .allow(MAX_FORWARD_PER_SEC);
+                        if !gate_ok {
+                            continue;
+                        }
                         if let Some(c) = clients.get_mut(&src) {
                             c.last = Instant::now();
                             if let Some((host, _)) = hosts.get(&c.token) {
@@ -215,6 +254,16 @@ impl RelayServer {
                         }
                     }
                     T_FROM_HOST if body.len() >= 4 => {
+                        if body.len() > MAX_FORWARD_BYTES + 4 {
+                            continue;
+                        }
+                        let gate_ok = host_gates
+                            .entry(src)
+                            .or_insert(FloodGate { start: Instant::now(), count: 0 })
+                            .allow(MAX_FORWARD_PER_SEC * 2);
+                        if !gate_ok {
+                            continue;
+                        }
                         let cid = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
                         let target = cids.get(&cid).copied();
                         if let Some(caddr) = target {
@@ -443,6 +492,20 @@ mod tests {
     use super::*;
     use crate::config::{ECHO_REQ, ECHO_RESP};
     use crate::net::{start_proxy_relay, EchoServer};
+
+    #[test]
+    fn forward_gate_caps_burst_then_resets() {
+        assert!(forward_payload_ok(0));
+        assert!(forward_payload_ok(MAX_FORWARD_BYTES));
+        assert!(!forward_payload_ok(MAX_FORWARD_BYTES + 1));
+        let mut g = FloodGate { start: Instant::now(), count: 0 };
+        for _ in 0..MAX_FORWARD_PER_SEC {
+            assert!(g.allow(MAX_FORWARD_PER_SEC));
+        }
+        assert!(!g.allow(MAX_FORWARD_PER_SEC));
+        g.start = Instant::now() - Duration::from_secs(2);
+        assert!(g.allow(MAX_FORWARD_PER_SEC));
+    }
 
     fn free_port() -> u16 {
         UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
