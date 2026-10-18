@@ -34,6 +34,7 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(name = "puppytunnel", version = "beta 1.0")]
 #[command(about = "PuppyTunnel: host and join Roblox Studio sessions through a tunnel or private relay")]
+#[command(after_help = "Report issues on https://github.com/novembahh/puppytunnelrblx/issues/")]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,

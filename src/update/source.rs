@@ -34,7 +34,7 @@ impl fmt::Display for UpdateSourceError {
         match self {
             UpdateSourceError::NetworkError(e) => write!(f, "Network error fetching updates: {}", e),
             UpdateSourceError::HttpError(code, e) => {
-                write!(f, "HTTP error {} fetching updates: {}", code, e)
+                write!(f, "HTTP error {} fetching updates: {} (report issues on https://github.com/novembahh/puppytunnelrblx/issues/)", code, e)
             }
             UpdateSourceError::ParseError(e) => {
                 write!(f, "Failed to parse update manifest: {}", e)

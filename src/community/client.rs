@@ -271,7 +271,7 @@ impl CommunityClient {
                         .into_json::<serde_json::Value>()
                         .ok()
                         .and_then(|v| v["error"].as_str().map(String::from));
-                    format!("server error {}{}", c, msg.map(|m| format!(": {}", m)).unwrap_or_default())
+                    format!("server error {}{} (report issues on https://github.com/novembahh/puppytunnelrblx/issues/)", c, msg.map(|m| format!(": {}", m)).unwrap_or_default())
                 }
                 e => e.to_string(),
             })?;

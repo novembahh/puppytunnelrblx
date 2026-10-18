@@ -51,6 +51,9 @@ node_modules/
 .dev.vars
 dist/
 
+# Local agent rules
+AGENTS.md
+
 # OS / editors
 .DS_Store
 Thumbs.db
@@ -59,3 +62,13 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Local scratch verification scripts
+__tmp_*
+
+# IDA analysis databases
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
