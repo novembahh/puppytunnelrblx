@@ -5,6 +5,7 @@ pub const VINEGAR: &str = "__VINEGAR__";
 
 pub fn get_studio_path() -> String {
     if cfg!(windows) {
+        let mut hits: Vec<PathBuf> = Vec::new();
 
         if let Ok(out) = Command::new("reg")
             .args(["query", r"HKCU\Software\ROBLOX Corporation\Environments\roblox-studio", "/v", "clientExe"])
@@ -14,59 +15,41 @@ pub fn get_studio_path() -> String {
                 let text = String::from_utf8_lossy(&out.stdout);
                 for line in text.lines() {
                     if let Some(pos) = line.find("REG_SZ") {
-                        let path = line[pos + 6..].trim();
-                        if Path::new(path).is_file() {
-                            return path.to_string();
+                        let path = Path::new(line[pos + 6..].trim());
+                        if path.is_file() {
+                            hits.push(path.to_path_buf());
                         }
                     }
                 }
             }
         }
 
-
+        let mut roots: Vec<PathBuf> = Vec::new();
         if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
-            let versions_dir = Path::new(&local_app).join("Roblox").join("Versions");
-            if let Ok(entries) = std::fs::read_dir(&versions_dir) {
-                let mut hits: Vec<PathBuf> = Vec::new();
+            roots.push(Path::new(&local_app).join("Roblox"));
+        }
+        for pf in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Ok(dir) = std::env::var(pf) {
+                roots.push(Path::new(&dir).join("Roblox"));
+            }
+        }
+        for root in roots {
+            if let Ok(entries) = std::fs::read_dir(root.join("Versions")) {
                 for entry in entries.flatten() {
                     let exe = entry.path().join("RobloxStudioBeta.exe");
                     if exe.is_file() {
                         hits.push(exe);
                     }
                 }
-                hits.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-                if let Some(newest) = hits.last() {
-                    return newest.to_string_lossy().to_string();
-                }
             }
-
-            let alt = Path::new(&local_app).join("Roblox").join("RobloxStudioBeta.exe");
+            let alt = root.join("RobloxStudioBeta.exe");
             if alt.is_file() {
-                return alt.to_string_lossy().to_string();
+                hits.push(alt);
             }
         }
 
-
-        for pf in ["ProgramFiles", "ProgramFiles(x86)"] {
-            if let Ok(dir) = std::env::var(pf) {
-                let versions = Path::new(&dir).join("Roblox").join("Versions");
-                if let Ok(entries) = std::fs::read_dir(&versions) {
-                    let mut hits: Vec<PathBuf> = Vec::new();
-                    for entry in entries.flatten() {
-                        let exe = entry.path().join("RobloxStudioBeta.exe");
-                        if exe.is_file() {
-                            hits.push(exe);
-                        }
-                    }
-                    hits.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
-                    if let Some(newest) = hits.last() {
-                        return newest.to_string_lossy().to_string();
-                    }
-                }
-            }
-        }
-
-        String::new()
+        hits.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        hits.last().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
     } else if cfg!(target_os = "macos") {
         let home = std::env::var("HOME").unwrap_or_default();
         let candidates = [
@@ -86,6 +69,14 @@ pub fn get_studio_path() -> String {
         {
             if out.status.success() {
                 return VINEGAR.to_string();
+            }
+        }
+        if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let bin = dir.join("vinegar");
+                if bin.is_file() {
+                    return bin.to_string_lossy().to_string();
+                }
             }
         }
         if let Ok(home) = std::env::var("HOME") {
@@ -108,6 +99,11 @@ pub fn build_cmd(studio: &str, args: &[&str]) -> Command {
     let mut cmd = if studio == VINEGAR {
         let mut c = Command::new("flatpak");
         c.args(["run", "org.vinegarhq.Vinegar", "studio", "--"]);
+        c.args(args);
+        c
+    } else if Path::new(studio).file_stem().map_or(false, |n| n == "vinegar") {
+        let mut c = Command::new(studio);
+        c.args(["studio", "--"]);
         c.args(args);
         c
     } else {

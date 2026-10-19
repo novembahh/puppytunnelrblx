@@ -108,9 +108,7 @@ pub fn detect_roblox_user() -> Option<u64> {
             }
         }
     } else if cfg!(target_os = "linux") {
-        if let Ok(home) = std::env::var("HOME") {
-            let roblox_dir = PathBuf::from(home).join(".var/app/org.vinegarhq.Vinegar/data/Roblox");
-            let logs_dir = roblox_dir.join("logs");
+        if let Some(logs_dir) = crate::roblox::watcher::roblox_log_dir() {
             if let Ok(entries) = fs::read_dir(&logs_dir) {
                 let mut logs: Vec<PathBuf> = entries
                     .flatten()

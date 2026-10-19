@@ -8,6 +8,29 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+pub fn linux_roblox_dirs() -> Vec<PathBuf> {
+    let mut bases: Vec<PathBuf> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        bases.push(home.join(".var/app/org.vinegarhq.Vinegar/data"));
+        bases.push(match std::env::var_os("XDG_DATA_HOME") {
+            Some(x) => PathBuf::from(x),
+            None => home.join(".local/share"),
+        });
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for base in bases {
+        dirs.push(base.join("Roblox"));
+        let users = base.join("vinegar/prefixes/studio/drive_c/users");
+        if let Ok(entries) = std::fs::read_dir(users) {
+            for entry in entries.flatten() {
+                dirs.push(entry.path().join("AppData/Local/Roblox"));
+            }
+        }
+    }
+    dirs.into_iter().filter(|d| d.is_dir()).collect()
+}
+
 pub fn roblox_log_dir() -> Option<PathBuf> {
     if cfg!(windows) {
         let base = std::env::var("LOCALAPPDATA").ok()?;
@@ -26,14 +49,13 @@ pub fn roblox_log_dir() -> Option<PathBuf> {
             None
         }
     } else if cfg!(target_os = "linux") {
-        let home = std::env::var("HOME").ok()?;
-        let p = PathBuf::from(home)
-            .join(".var/app/org.vinegarhq.Vinegar/data/Roblox/logs");
-        if p.is_dir() {
-            Some(p)
-        } else {
-            None
-        }
+        let mut hits: Vec<PathBuf> = linux_roblox_dirs()
+            .into_iter()
+            .map(|d| d.join("logs"))
+            .filter(|p| p.is_dir())
+            .collect();
+        hits.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        hits.pop()
     } else {
         None
     }

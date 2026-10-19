@@ -1247,6 +1247,10 @@ impl NepApp {
                 ui.label(RichText::new("The media site will see your IP.").size(12.5).color(WARN));
             }
         });
+        ui.add_space(12.0);
+        card(ui, None, |ui| {
+            path_field(ui, "Roblox Studio", &mut self.config.studio, "Path to RobloxStudioBeta", || self.picker_request = Some(PickTarget::Studio));
+        });
         ui.add_space(16.0);
         if primary(ui, "Connect", true) {
             save_config(&self.config);
