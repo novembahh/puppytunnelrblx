@@ -8,6 +8,7 @@
   [![Discord](https://img.shields.io/badge/DISCORD-join-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://dsc.gg/puppytunnel)
 
   [![Download](.github/assets/download.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/PuppyTunnel-Windows-x86_64.exe)
+  [![Linux](.github/assets/linux.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/PuppyTunnel-Linux-x86_64)
   [![PDB](.github/assets/pdb.svg)](https://github.com/novembahh/puppytunnelrblx/releases/download/nightly/PuppyTunnel-Windows-x86_64.pdb)
   <br><br>
 

@@ -24,3 +24,16 @@ jobs:
         with:
           name: PuppyTunnel-Windows-x86_64-PDB
           path: target/release/puppytunnel.pdb
+
+  build-linux:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/build-linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PuppyTunnel-Linux-x86_64
+          path: PuppyTunnel-Linux-x86_64

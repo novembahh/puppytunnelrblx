@@ -1,0 +1,31 @@
+name: Build Linux
+description: Portable Linux release build with ALSA linked statically
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build static ALSA
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pkg-config bzip2
+        curl -sSL -o alsa.tar.bz2 https://www.alsa-project.org/files/pub/lib/alsa-lib-1.2.12.tar.bz2
+        tar -xjf alsa.tar.bz2
+        cd alsa-lib-1.2.12
+        ./configure --prefix="$RUNNER_TEMP/alsa" --enable-static --disable-shared --disable-python
+        make -j"$(nproc)"
+        make install
+
+    - name: Build (release)
+      shell: bash
+      env:
+        ALSA_STATIC: "1"
+        PKG_CONFIG_PATH: ${{ runner.temp }}/alsa/lib/pkgconfig
+      run: |
+        cargo build --release
+        strip target/release/puppytunnel
+        cp target/release/puppytunnel PuppyTunnel-Linux-x86_64
+        chmod +x PuppyTunnel-Linux-x86_64
