@@ -407,7 +407,7 @@ pub fn write_session_log(
     );
 
     let lin_cmd = format!(
-        "flatpak run org.vinegarhq.Vinegar studio -- -task StartClient -placeId 0 -universeId 0 -placeVersion 0 -server {} -port {} -parentSessionGuid {} -playTestSessionGuid {} -instanceId StudioPlayer_0",
+        "flatpak run org.vinegarhq.Vinegar -task StartClient -placeId 0 -universeId 0 -placeVersion 0 -server {} -port {} -parentSessionGuid {} -playTestSessionGuid {} -instanceId StudioPlayer_0",
         host, dp, pg, tg
     );
 

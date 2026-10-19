@@ -21,12 +21,7 @@ pub fn linux_roblox_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     for base in bases {
         dirs.push(base.join("Roblox"));
-        let users = base.join("vinegar/prefixes/studio/drive_c/users");
-        if let Ok(entries) = std::fs::read_dir(users) {
-            for entry in entries.flatten() {
-                dirs.push(entry.path().join("AppData/Local/Roblox"));
-            }
-        }
+        dirs.push(base.join("vinegar/appdata/Roblox"));
     }
     dirs.into_iter().filter(|d| d.is_dir()).collect()
 }

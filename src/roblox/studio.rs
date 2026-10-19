@@ -116,12 +116,7 @@ pub fn build_cmd(studio: &str, args: &[&str]) -> Command {
     let studio = routed.as_deref().unwrap_or(studio);
     let mut cmd = if studio == VINEGAR {
         let mut c = Command::new("flatpak");
-        c.args(["run", "org.vinegarhq.Vinegar", "studio", "--"]);
-        c.args(args);
-        c
-    } else if Path::new(studio).file_stem().map_or(false, |n| n == "vinegar") {
-        let mut c = Command::new(studio);
-        c.args(["studio", "--"]);
+        c.args(["run", "org.vinegarhq.Vinegar"]);
         c.args(args);
         c
     } else {
