@@ -71,13 +71,8 @@ pub fn get_studio_path() -> String {
                 return VINEGAR.to_string();
             }
         }
-        if let Some(path_var) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&path_var) {
-                let bin = dir.join("vinegar");
-                if bin.is_file() {
-                    return bin.to_string_lossy().to_string();
-                }
-            }
+        if let Some(bin) = native_vinegar() {
+            return bin.to_string_lossy().to_string();
         }
         if let Ok(home) = std::env::var("HOME") {
             let grapejuice = PathBuf::from(home).join(".local/share/grapejuice/prefixes/player/drive_c/Program Files (x86)/Roblox/Versions");
@@ -95,7 +90,30 @@ pub fn get_studio_path() -> String {
     }
 }
 
+fn native_vinegar() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join("vinegar"))
+        .find(|bin| bin.is_file())
+}
+
+fn vinegar_managed_exe(studio: &str) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let lower = studio.to_ascii_lowercase();
+    if !lower.contains("vinegar") || !lower.ends_with("robloxstudiobeta.exe") {
+        return None;
+    }
+    if lower.contains("org.vinegarhq.vinegar") {
+        return Some(VINEGAR.to_string());
+    }
+    native_vinegar().map(|bin| bin.to_string_lossy().to_string())
+}
+
 pub fn build_cmd(studio: &str, args: &[&str]) -> Command {
+    let routed = vinegar_managed_exe(studio);
+    let studio = routed.as_deref().unwrap_or(studio);
     let mut cmd = if studio == VINEGAR {
         let mut c = Command::new("flatpak");
         c.args(["run", "org.vinegarhq.Vinegar", "studio", "--"]);
