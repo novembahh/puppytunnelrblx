@@ -240,6 +240,7 @@ fn route_unframed(
     };
     if let Some(c) = clients.get_mut(&src) {
         c.last = Instant::now();
+        c.open = true;
     }
     let mut payload = cid.to_be_bytes().to_vec();
     payload.extend_from_slice(&frame(T_OPEN, &buf[..n]));
@@ -365,8 +366,8 @@ impl RelayServer {
                             let _ = sock.send_to(&frame(T_NO_HOST, &[]), src);
                             continue;
                         }
-                        let same = clients.get(&src).map(|c| c.token == token && c.open).unwrap_or(false);
-                        if !same {
+                        let known = clients.get(&src).map(|c| c.token == token).unwrap_or(false);
+                        if !known {
                             let open_count = clients.values().filter(|c| c.open).count();
                             if open_count >= MAX_OPEN || clients.len() >= MAX_CLIENTS {
                                 continue;
@@ -430,6 +431,7 @@ impl RelayServer {
                             continue;
                         }
                         entry.last = Instant::now();
+                        entry.open = false;
                         if let Some((host, _)) = hosts.get(&entry.token) {
                             let mut payload = entry.cid.to_be_bytes().to_vec();
                             if entry.open {
@@ -459,7 +461,12 @@ impl RelayServer {
                                 .and_then(|c| hosts.get(&c.token))
                                 .map_or(false, |(h, _)| *h == src);
                             if authorised {
-                                let _ = sock.send_to(&frame(T_S_DATA, &body[4..]), caddr);
+                                let open = clients.get(&caddr).map(|c| c.open).unwrap_or(false);
+                                if open {
+                                    let _ = sock.send_to(&body[4..], caddr);
+                                } else {
+                                    let _ = sock.send_to(&frame(T_S_DATA, &body[4..]), caddr);
+                                }
                             }
                         }
                     }
@@ -837,15 +844,33 @@ mod tests {
         relay.stop();
     }
 
+    fn spawn_echo(port: u16) -> Arc<AtomicBool> {
+        let sock = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], port))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let run = Arc::new(AtomicBool::new(true));
+        let r = Arc::clone(&run);
+        thread::spawn(move || {
+            let mut b = [0u8; 2048];
+            while r.load(Ordering::SeqCst) {
+                match sock.recv_from(&mut b) {
+                    Ok((n, from)) => {
+                        let _ = sock.send_to(&b[..n], from);
+                    }
+                    Err(_) => continue,
+                }
+            }
+        });
+        run
+    }
+
     #[test]
     fn open_client_reaches_studio_as_neptunnel() {
         let relay_port = free_port();
         let studio_port = free_port();
         let relay_addr: SocketAddr = ([127, 0, 0, 1], relay_port).into();
 
+        let studio = spawn_echo(studio_port);
         let mut relay = RelayServer::start(relay_addr, |_| {}).unwrap();
-        let mut echo = EchoServer::new();
-        echo.start(studio_port).unwrap();
 
         let identity = Identity::ephemeral();
         let token = identity.token();
@@ -863,33 +888,37 @@ mod tests {
         }
 
         let c = UdpSocket::bind("127.0.0.1:0").unwrap();
-        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        c.send_to(&frame(T_OPEN, &token), relay_addr).unwrap();
-        let mut ack = [0u8; 32];
-        let n = c.recv(&mut ack).expect("no ack for the open client");
-        assert!(n >= 5 && &ack[..5] == &frame(T_ACK_CLIENT, &[])[..]);
+        c.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
 
-        let mut req = ECHO_REQ.to_vec();
-        req.extend_from_slice(b"neptunel");
-        c.send_to(&frame(T_C_DATA, &req), relay_addr).unwrap();
-        let mut b = [0u8; 64];
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut got = false;
-        while Instant::now() < deadline {
-            let n = match c.recv(&mut b) {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            if n >= 5 && &b[..4] == MAGIC && b[4] == T_S_DATA && b[5..n].starts_with(ECHO_RESP) {
-                got = true;
-                break;
+        let mut raw = false;
+        while Instant::now() < deadline && !raw {
+            let _ = c.send_to(b"plain-datagram", relay_addr);
+            let mut b = [0u8; 256];
+            if let Ok(n) = c.recv(&mut b) {
+                if b[..n] == b"plain-datagram"[..] {
+                    raw = true;
+                }
             }
         }
-        assert!(got, "plain Neptunnel datagram did not survive the relay");
+        assert!(raw, "unframed Neptunnel datagram did not round-trip");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut framed = false;
+        while Instant::now() < deadline && !framed {
+            let _ = c.send_to(&frame(T_C_DATA, b"framed-payload"), relay_addr);
+            let mut b = [0u8; 256];
+            if let Ok(n) = c.recv(&mut b) {
+                if n >= 5 && &b[..4] == MAGIC && b[4] == T_S_DATA && b[5..n] == b"framed-payload"[..] {
+                    framed = true;
+                }
+            }
+        }
+        assert!(framed, "framed Neptunnel datagram did not survive the relay");
 
         stop.store(true, Ordering::SeqCst);
         agent.join().unwrap().unwrap();
-        echo.stop();
+        studio.store(false, Ordering::SeqCst);
         relay.stop();
     }
 
