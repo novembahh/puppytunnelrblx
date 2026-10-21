@@ -24,7 +24,7 @@ use crate::rbxapi::{self, RobloxUser};
 use crate::ui::picker::{native_pick, PickResult, PickTarget, Picker};
 use crate::ui::widgets::*;
 use eframe::egui::{
-    self, Align, Color32, Layout, Margin, RichText, Rounding, ScrollArea, Sense, Vec2,
+    self, Align, Color32, Layout, Margin, RichText, Rounding, ScrollArea, Sense, Stroke, Vec2,
 };
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -402,6 +402,10 @@ impl Drop for NepApp {
 }
 
 impl eframe::App for NepApp {
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(100));
         handle_resize(ctx);
@@ -450,21 +454,21 @@ impl eframe::App for NepApp {
 
         let compact = ctx.screen_rect().width() < 900.0;
         egui::TopBottomPanel::top("titlebar")
-            .exact_height(60.0)
-            .frame(egui::Frame::none().fill(BG).inner_margin(Margin::symmetric(18.0, 0.0)))
+            .exact_height(58.0)
+            .frame(egui::Frame::none().fill(BG_SOFT).inner_margin(Margin::symmetric(16.0, 0.0)))
             .show(ctx, |ui| self.render_titlebar(ui, ctx, compact));
 
         let section = section_of(self.screen);
         if section != Section::Home {
             egui::TopBottomPanel::top("subnav")
-                .exact_height(48.0)
-                .frame(egui::Frame::none().fill(BG).inner_margin(Margin::symmetric(18.0, 0.0)))
+                .exact_height(46.0)
+                .frame(egui::Frame::none().fill(BG_SOFT).inner_margin(Margin::symmetric(16.0, 0.0)))
                 .show(ctx, |ui| self.render_subnav(ui, section, compact));
         }
 
         egui::TopBottomPanel::bottom("status")
-            .exact_height(32.0)
-            .frame(egui::Frame::none().fill(BG).inner_margin(Margin::symmetric(24.0, 0.0)))
+            .exact_height(30.0)
+            .frame(egui::Frame::none().fill(BG_SOFT).inner_margin(Margin::symmetric(20.0, 0.0)))
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(RichText::new(&self.status_text).size(12.0).color(DIM));
@@ -541,15 +545,17 @@ fn load_rgba_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<eg
 }
 
 fn home_card(ui: &mut egui::Ui, w: f32, icon: Icon, title: &str, sub: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 120.0), Sense::click());
-    let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 116.0), Sense::click());
+    let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.16);
     let p = ui.painter();
-    let fill = CARD.lerp_to_gamma(FIELD, 0.6 * hover);
-    p.rect_filled(rect, Rounding::same(14.0), fill);
-    let badge = egui::pos2(rect.left() + 34.0, rect.top() + 34.0);
-    crate::ui::icons::paint(p, badge, 22.0, icon, MINT);
-    p.text(egui::pos2(rect.left() + 18.0, rect.top() + 72.0), egui::Align2::LEFT_CENTER, lc(title), egui::FontId::proportional(15.0), INK);
-    let galley = p.layout(lc(sub), egui::FontId::proportional(12.0), DIM, rect.width() - 36.0);
+    let fill = CARD.lerp_to_gamma(CARD_HI, hover);
+    p.rect_filled(rect, Rounding::same(RADIUS), fill);
+    p.rect_stroke(rect, Rounding::same(RADIUS), Stroke::new(1.0_f32, LINE.lerp_to_gamma(MINT_DIM, hover)));
+    let badge = egui::pos2(rect.left() + 33.0, rect.top() + 34.0);
+    p.circle_filled(badge, 17.0, FIELD.lerp_to_gamma(MINT_DIM, hover * 0.35));
+    crate::ui::icons::paint(p, badge, 19.0, icon, MINT);
+    p.text(egui::pos2(rect.left() + 18.0, rect.top() + 72.0), egui::Align2::LEFT_CENTER, lc(title), egui::FontId::proportional(14.5), INK);
+    let galley = p.layout(lc(sub), egui::FontId::proportional(11.5), DIM, rect.width() - 36.0);
     p.galley(egui::pos2(rect.left() + 18.0, rect.top() + 86.0), galley, DIM);
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if resp.clicked() {
@@ -1163,9 +1169,9 @@ impl NepApp {
         }
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Server").size(24.0).color(INK));
-            let (text, color) = if self.server_live { ("Live", MINT) } else { ("Starting", DIM) };
-            ui.label(RichText::new(text).size(13.0).color(color));
+            ui.label(RichText::new(lc("server")).size(22.0).color(INK));
+            let (text, color) = if self.server_live { ("live", MINT) } else { ("starting", DIM) };
+            chip(ui, text, color);
         });
         if self.invite.is_some() {
             ui.label(muted(format!("{} connected", self.players.load(Ordering::Relaxed))));
@@ -1331,10 +1337,10 @@ impl NepApp {
 
     fn render_join_running(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Connection").size(24.0).color(INK));
+            ui.label(RichText::new(lc("connection")).size(22.0).color(INK));
             let running = self.proxy_handle.as_ref().map_or(false, |p| p.is_running());
-            let (text, color) = if running { ("Connected", MINT) } else { ("Stopped", ERR) };
-            ui.label(RichText::new(text).size(13.0).color(color));
+            let (text, color) = if running { ("connected", MINT) } else { ("stopped", ERR) };
+            chip(ui, text, color);
         });
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -1394,7 +1400,7 @@ impl NepApp {
         };
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("servers").size(24.0).color(INK));
+            ui.label(RichText::new(lc("servers")).size(22.0).color(INK));
             if loading {
                 chip(ui, "refreshing", DIM);
             } else if error.is_empty() {

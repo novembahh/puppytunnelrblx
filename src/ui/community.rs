@@ -21,7 +21,7 @@ use crate::ui::theme::*;
 use crate::ui::widgets::*;
 use eframe::egui::{
     self, Align, Color32, Frame, Id, Layout, Margin, Pos2, Rect, RichText, Rounding,
-    ScrollArea, Sense, TextEdit, Ui, UiBuilder, Vec2,
+    ScrollArea, Sense, Stroke, TextEdit, Ui, UiBuilder, Vec2,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -583,8 +583,9 @@ impl CommunityUiState {
                     let focused = ui.memory(|m| m.has_focus(Id::new("feed_composer")));
                     Frame::none()
                         .fill(if focused { FIELD_HI } else { FIELD })
-                        .rounding(14.0)
-                        .inner_margin(Margin::symmetric(14.0, 10.0))
+                        .stroke(Stroke::new(1.0_f32, if focused { MINT_DIM } else { LINE }))
+                        .rounding(RADIUS_SM)
+                        .inner_margin(Margin::symmetric(13.0, 10.0))
                         .show(ui, |ui| {
                             ui.add(
                                 TextEdit::multiline(&mut self.composer_text)

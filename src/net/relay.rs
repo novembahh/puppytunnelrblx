@@ -55,6 +55,7 @@ impl FloodGate {
 
 const BIND_TTL_SECS: u64 = 60;
 const BIND_CHALLENGE_TTL_SECS: u64 = 300;
+const MAX_PENDING_CHALLENGES: usize = 4096;
 
 pub struct BindRecord {
     pub addr: SocketAddr,
@@ -114,6 +115,12 @@ impl BindRegistry {
             !m.is_empty()
         });
         self.challenges.retain(|_, (_, _, t)| t.elapsed() < Duration::from_secs(BIND_CHALLENGE_TTL_SECS));
+        if self.challenges.len() > MAX_PENDING_CHALLENGES {
+            let mut ages: Vec<Instant> = self.challenges.values().map(|(_, _, t)| *t).collect();
+            ages.sort_by_key(|t| std::cmp::Reverse(t.elapsed()));
+            let cutoff = ages[MAX_PENDING_CHALLENGES - 1];
+            self.challenges.retain(|_, (_, _, t)| *t >= cutoff);
+        }
     }
 }
 
@@ -221,7 +228,7 @@ impl RelayServer {
                     clients.retain(|_, c| c.last.elapsed() < CLIENT_TTL);
                     cids.retain(|_, a| clients.contains_key(a));
                     client_gates.retain(|a, _| clients.contains_key(a));
-                    thread_binds.lock().unwrap().prune();
+                    thread_binds.lock().unwrap_or_else(|e| e.into_inner()).prune();
                     host_gates.retain(|_, g| g.start.elapsed() < Duration::from_secs(10));
                 }
 
@@ -247,9 +254,10 @@ impl RelayServer {
                         let token = token_of(&pk);
                         let allowed = match hosts.get(&token) {
                             Some((addr, seen)) => *addr == src || seen.elapsed() >= HOST_TTL,
-                            None => hosts.len() < MAX_HOSTS,
+                            None => hosts.len() < MAX_HOSTS || hosts.values().any(|(_, seen)| seen.elapsed() >= HOST_TTL),
                         };
                         if allowed {
+                            hosts.retain(|_, (_, seen)| seen.elapsed() < HOST_TTL);
                             if !hosts.contains_key(&token) {
                                 log(&format!("host registered from {}", src));
                             }
@@ -277,7 +285,7 @@ impl RelayServer {
                     T_HELLO if body.len() == 16 => {
                         let mut token = [0u8; 16];
                         token.copy_from_slice(body);
-                        if !hosts.contains_key(&token) {
+                        if !hosts.get(&token).map_or(false, |(_, t)| t.elapsed() < HOST_TTL) {
                             let _ = sock.send_to(&frame(T_NO_HOST, &[]), src);
                             continue;
                         }
@@ -295,7 +303,7 @@ impl RelayServer {
                             c.token = token;
                             c.last = Instant::now();
                         }
-                        thread_binds.lock().unwrap().hello(token, src);
+                        thread_binds.lock().unwrap_or_else(|e| e.into_inner()).hello(token, src);
                         let _ = sock.send_to(&frame(T_ACK_CLIENT, &[]), src);
                     }
                     T_BYE if body.len() == 16 => {
@@ -305,7 +313,7 @@ impl RelayServer {
                         clients.retain(|addr, c| !(addr == &src && c.token == token));
                         if clients.len() != before {
                             cids.retain(|_, a| clients.contains_key(a));
-                            thread_binds.lock().unwrap().remove(&token, &src);
+                            thread_binds.lock().unwrap_or_else(|e| e.into_inner()).remove(&token, &src);
                             log(&format!("client left from {}", src));
                         }
                     }
@@ -313,6 +321,7 @@ impl RelayServer {
                         if !forward_payload_ok(body.len()) {
                             continue;
                         }
+                        let Some(entry) = clients.get_mut(&src) else { continue };
                         let gate_ok = client_gates
                             .entry(src)
                             .or_insert(FloodGate { start: Instant::now(), count: 0 })
@@ -320,13 +329,11 @@ impl RelayServer {
                         if !gate_ok {
                             continue;
                         }
-                        if let Some(c) = clients.get_mut(&src) {
-                            c.last = Instant::now();
-                            if let Some((host, _)) = hosts.get(&c.token) {
-                                let mut payload = c.cid.to_be_bytes().to_vec();
-                                payload.extend_from_slice(body);
-                                let _ = sock.send_to(&frame(T_TO_HOST, &payload), host);
-                            }
+                        entry.last = Instant::now();
+                        if let Some((host, _)) = hosts.get(&entry.token) {
+                            let mut payload = entry.cid.to_be_bytes().to_vec();
+                            payload.extend_from_slice(body);
+                            let _ = sock.send_to(&frame(T_TO_HOST, &payload), host);
                         }
                     }
                     T_FROM_HOST if body.len() >= 4 => {
@@ -361,7 +368,7 @@ impl RelayServer {
     }
 
     pub fn client_bindings(&self, token: &Token) -> Vec<SocketAddr> {
-        self.binds.lock().unwrap().bindings(token)
+        self.binds.lock().unwrap_or_else(|e| e.into_inner()).bindings(token)
     }
     pub fn stop(&mut self) {
         if self.running.swap(false, Ordering::SeqCst) {
@@ -463,6 +470,7 @@ where
     L: Fn(&str, &str),
 {
     let sock = Arc::new(UdpSocket::bind("0.0.0.0:0")?);
+    sock.connect(relay)?;
     sock.set_read_timeout(Some(Duration::from_millis(500)))?;
 
     let mut sessions: HashMap<u32, LocalSession> = HashMap::new();
@@ -479,7 +487,7 @@ where
             let mut reg = identity.public().to_vec();
             reg.extend_from_slice(&ts.to_be_bytes());
             reg.extend_from_slice(&identity.sign(&reg_message(ts)));
-            let _ = sock.send_to(&frame(T_REG, &reg), relay);
+            let _ = sock.send(&frame(T_REG, &reg));
             last_reg = Some(Instant::now());
             if connected && last_ack.map_or(true, |t| t.elapsed() > Duration::from_secs(20)) {
                 connected = false;
@@ -487,12 +495,12 @@ where
             }
         }
 
-        let (n, src) = match sock.recv_from(&mut buf) {
+        let n = match sock.recv(&mut buf) {
             Ok(v) => v,
             Err(ref e) if is_transient(e) => continue,
             Err(_) => break,
         };
-        if src != relay || n < 5 || &buf[..4] != MAGIC {
+        if n < 5 || &buf[..4] != MAGIC {
             continue;
         }
         match buf[4] {
@@ -507,6 +515,10 @@ where
                 let cid = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
                 sessions.retain(|_, s| s.alive.load(Ordering::SeqCst));
                 if !sessions.contains_key(&cid) {
+                    if sessions.len() >= MAX_CLIENTS {
+                        log("Too many remote players; refusing a new relay session.", "warn");
+                        continue;
+                    }
                     let local = match UdpSocket::bind("127.0.0.1:0") {
                         Ok(s) => Arc::new(s),
                         Err(_) => continue,

@@ -16,23 +16,24 @@ pub fn muted(text: impl AsRef<str>) -> RichText {
 }
 
 pub fn page_header(ui: &mut Ui, title: &str, subtitle: &str) {
-    ui.label(RichText::new(lc(title)).size(24.0).color(INK));
+    ui.label(RichText::new(lc(title)).size(22.0).color(INK));
     if !subtitle.is_empty() {
         ui.label(muted(subtitle));
     }
-    ui.add_space(14.0);
+    ui.add_space(16.0);
 }
 
 pub fn card<R>(ui: &mut Ui, title: Option<&str>, add: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::none()
         .fill(CARD)
-        .rounding(18.0)
-        .inner_margin(Margin::same(20.0))
+        .stroke(Stroke::new(1.0_f32, LINE))
+        .rounding(RADIUS)
+        .inner_margin(Margin::symmetric(18.0, 16.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             if let Some(t) = title {
-                ui.label(RichText::new(lc(t)).size(13.0).color(DIM));
-                ui.add_space(6.0);
+                ui.label(RichText::new(lc(t)).size(11.0).color(DIM));
+                ui.add_space(7.0);
             }
             add(ui)
         })
@@ -50,23 +51,18 @@ pub fn text_input(ui: &mut Ui, id: egui::Id, value: &mut String, hint: &str, wid
     let outer = if width.is_finite() { width } else { ui.available_width() };
     let resp = Frame::none()
         .fill(if focused { FIELD_HI } else { FIELD })
-        .rounding(14.0)
-        .inner_margin(Margin::symmetric(14.0, 9.0))
+        .stroke(Stroke::new(1.0_f32, if focused { MINT_DIM } else { LINE }))
+        .rounding(RADIUS_SM)
+        .inner_margin(Margin::symmetric(13.0, 8.0))
         .show(ui, |ui| {
             ui.add(
                 TextEdit::singleline(value)
                     .id(id)
                     .frame(false)
                     .hint_text(RichText::new(lc(hint)).color(DIM))
-                    .desired_width(outer - 28.0),
+                    .desired_width(outer - 26.0),
             )
         });
-
-    let r = resp.response.rect;
-    ui.painter().line_segment(
-        [pos2(r.left() + 12.0, r.top() + 1.0), pos2(r.right() - 12.0, r.top() + 1.0)],
-        Stroke::new(1.0_f32, Color32::from_black_alpha(46)),
-    );
     resp.inner
 }
 
@@ -77,6 +73,7 @@ fn pos2(x: f32, y: f32) -> Pos2 {
 
 pub fn rounded_outline(rect: Rect, r: f32) -> Vec<Pos2> {
     let r = r.min(rect.height() * 0.5).min(rect.width() * 0.5);
+    let steps = ((r * 1.6) as usize).clamp(4, 14);
     let mut pts = Vec::new();
     for (cx, cy, a0) in [
         (rect.right() - r, rect.top() + r, -PI / 2.0),
@@ -84,8 +81,8 @@ pub fn rounded_outline(rect: Rect, r: f32) -> Vec<Pos2> {
         (rect.left() + r, rect.bottom() - r, PI / 2.0),
         (rect.left() + r, rect.top() + r, PI),
     ] {
-        for i in 0..=8 {
-            let a = a0 + (PI / 2.0) * i as f32 / 8.0;
+        for i in 0..=steps {
+            let a = a0 + (PI / 2.0) * i as f32 / steps as f32;
             pts.push(pos2(cx + r * a.cos(), cy + r * a.sin()));
         }
     }
@@ -127,16 +124,6 @@ pub enum Tone {
     Soft,
     Danger,
 }
-
-fn tone_colors(tone: Tone) -> (Color32, Color32, Color32) {
-
-    match tone {
-        Tone::Mint => (Color32::from_rgb(126, 240, 194), Color32::from_rgb(78, 207, 154), MINT_INK),
-        Tone::Soft => (Color32::from_rgb(62, 56, 54), Color32::from_rgb(44, 40, 39), INK),
-        Tone::Danger => (Color32::from_rgb(236, 98, 86), Color32::from_rgb(196, 62, 52), Color32::WHITE),
-    }
-}
-
 
 fn jelly_body(ui: &Ui, rect: Rect, resp: &Response, tone: Tone, enabled: bool) -> Color32 {
     let (fill, text) = match tone {
@@ -282,8 +269,8 @@ pub fn toggle(ui: &mut Ui, value: &mut bool, label: &str) {
         let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
         let t = ui.ctx().animate_bool_with_time(resp.id, *value, 0.16);
         let r = rect.height() * 0.5;
-        let track_top = lerp_color(Color32::from_rgb(46, 42, 41), Color32::from_rgb(126, 240, 194), t);
-        let track_bottom = lerp_color(Color32::from_rgb(62, 56, 54), Color32::from_rgb(78, 207, 154), t);
+        let track_top = lerp_color(FIELD_LO, MINT, t);
+        let track_bottom = lerp_color(FIELD_HI, MINT_DIM, t);
         let _ = (track_bottom, r);
         ui.painter().rect_filled(rect, Rounding::same(rect.height() * 0.5), track_top);
         let knob_r = if resp.hovered() { 10.0 } else { 9.5 };
@@ -292,7 +279,7 @@ pub fn toggle(ui: &mut Ui, value: &mut bool, label: &str) {
         ui.painter().circle_filled(c + Vec2::new(0.0, 1.5), knob_r, Color32::from_black_alpha(60));
         ui.painter().circle_filled(c, knob_r, lerp_color(Color32::from_rgb(236, 228, 221), Color32::from_rgb(250, 248, 245), t));
         let text = ui
-            .add(egui::Label::new(RichText::new(lc(label)).size(14.0).color(INK)).sense(Sense::click()))
+            .add(egui::Label::new(RichText::new(lc(label)).size(13.5).color(INK)).sense(Sense::click()))
             .on_hover_cursor(CursorIcon::PointingHand);
         if resp.clicked() || text.clicked() {
             *value = !*value;
@@ -305,8 +292,9 @@ pub fn toggle(ui: &mut Ui, value: &mut bool, label: &str) {
 pub fn row_frame<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::none()
         .fill(CARD)
-        .rounding(14.0)
-        .inner_margin(Margin::symmetric(16.0, 12.0))
+        .stroke(Stroke::new(1.0_f32, LINE))
+        .rounding(RADIUS_SM)
+        .inner_margin(Margin::symmetric(14.0, 11.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui)

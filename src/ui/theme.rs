@@ -3,20 +3,26 @@ use eframe::egui::{
     Style, Vec2, Visuals,
 };
 
-pub const BG: Color32 = Color32::from_rgb(16, 13, 12);
-pub const CARD: Color32 = Color32::from_rgb(26, 23, 22);
-pub const FIELD: Color32 = Color32::from_rgb(37, 33, 32);
-pub const FIELD_HI: Color32 = Color32::from_rgb(47, 42, 40);
-pub const FIELD_LO: Color32 = Color32::from_rgb(58, 52, 50);
-pub const INK: Color32 = Color32::from_rgb(236, 228, 221);
-pub const DIM: Color32 = Color32::from_rgb(155, 143, 135);
-pub const MINT: Color32 = Color32::from_rgb(95, 227, 172);
-pub const MINT_HOVER: Color32 = Color32::from_rgb(120, 238, 188);
-pub const MINT_INK: Color32 = Color32::from_rgb(10, 28, 20);
-pub const ERR: Color32 = Color32::from_rgb(222, 75, 64);
-pub const WARN: Color32 = Color32::from_rgb(224, 178, 74);
+pub const BG: Color32 = Color32::from_rgb(13, 12, 16);
+pub const BG_SOFT: Color32 = Color32::from_rgb(18, 17, 22);
+pub const CARD: Color32 = Color32::from_rgb(25, 23, 30);
+pub const CARD_HI: Color32 = Color32::from_rgb(32, 30, 38);
+pub const FIELD: Color32 = Color32::from_rgb(33, 31, 39);
+pub const FIELD_HI: Color32 = Color32::from_rgb(42, 39, 49);
+pub const FIELD_LO: Color32 = Color32::from_rgb(52, 48, 60);
+pub const LINE: Color32 = Color32::from_rgb(41, 38, 47);
+pub const INK: Color32 = Color32::from_rgb(238, 233, 241);
+pub const DIM: Color32 = Color32::from_rgb(152, 145, 162);
+pub const MINT: Color32 = Color32::from_rgb(126, 231, 186);
+pub const MINT_HOVER: Color32 = Color32::from_rgb(146, 243, 201);
+pub const MINT_DIM: Color32 = Color32::from_rgb(63, 132, 107);
+pub const MINT_INK: Color32 = Color32::from_rgb(9, 27, 21);
+pub const ERR: Color32 = Color32::from_rgb(240, 120, 133);
+pub const WARN: Color32 = Color32::from_rgb(236, 196, 128);
 
-pub const PILL: f32 = 17.0;
+pub const PILL: f32 = 14.0;
+pub const RADIUS: f32 = 16.0;
+pub const RADIUS_SM: f32 = 11.0;
 
 fn install_fonts(ctx: &Context) {
     let mut fonts = FontDefinitions::default();
@@ -41,11 +47,12 @@ pub fn apply_theme(ctx: &Context) {
     v.panel_fill = BG;
     v.window_fill = CARD;
     v.window_stroke = Stroke::NONE;
-    v.window_rounding = Rounding::same(18.0);
+    v.window_rounding = Rounding::same(RADIUS);
+    v.menu_rounding = Rounding::same(RADIUS_SM);
     v.extreme_bg_color = FIELD;
     v.faint_bg_color = CARD;
     v.hyperlink_color = MINT;
-    v.selection.bg_fill = Color32::from_rgb(38, 92, 72);
+    v.selection.bg_fill = Color32::from_rgb(43, 88, 73);
     v.selection.stroke = Stroke::NONE;
     v.text_cursor.stroke = Stroke::new(1.5_f32, MINT);
 
