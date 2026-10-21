@@ -23,6 +23,7 @@ pub const T_S_DATA: u8 = 0x83;
 pub const T_NO_HOST: u8 = 0x84;
 pub const T_OPEN: u8 = 0x07;
 pub const T_OPEN_HOST: u8 = 0x0a;
+pub const T_SLOT: u8 = 0x8a;
 
 const HOST_TTL: Duration = Duration::from_secs(30);
 const CLIENT_TTL: Duration = Duration::from_secs(30);
@@ -265,6 +266,13 @@ impl RelayServer {
     where
         L: Fn(&str) + Send + 'static,
     {
+        Self::start_with_ingress(listen, 0, log)
+    }
+
+    pub fn start_with_ingress<L>(listen: SocketAddr, ingress: usize, log: L) -> io::Result<Self>
+    where
+        L: Fn(&str) + Send + 'static,
+    {
         let sock = UdpSocket::bind(listen)?;
         sock.set_read_timeout(Some(Duration::from_millis(500)))?;
         let running = Arc::new(AtomicBool::new(true));
@@ -275,6 +283,34 @@ impl RelayServer {
         let thread = thread::spawn(move || {
             let mut hosts: HashMap<Token, (SocketAddr, Instant)> = HashMap::new();
             let mut open_hosts: std::collections::HashSet<Token> = std::collections::HashSet::new();
+            let mut slots: HashMap<u16, Token> = HashMap::new();
+            let (slot_tx, slot_rx) = std::sync::mpsc::channel::<(u16, Vec<u8>, SocketAddr)>();
+            let mut slot_workers: Vec<JoinHandle<()>> = Vec::new();
+            let base_port = listen.port();
+            for i in 1..=ingress {
+                let port = match base_port.checked_add(i as u16) {
+                    Some(p) => p,
+                    None => break,
+                };
+                let Ok(sk) = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))) else { continue };
+                let _ = sk.set_read_timeout(Some(Duration::from_millis(200)));
+                let sk = Arc::new(sk);
+                let tx = slot_tx.clone();
+                let run_s = Arc::clone(&run);
+                slot_workers.push(thread::spawn(move || {
+                    let mut b = vec![0u8; 65536];
+                    while run_s.load(Ordering::SeqCst) {
+                        match sk.recv_from(&mut b) {
+                            Ok((n, from)) if n > 0 => {
+                                let _ = tx.send((port, b[..n].to_vec(), from));
+                            }
+                            Ok(_) => {}
+                            Err(ref e) if is_transient(e) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                }));
+            }
             let mut last_unframed_warn = Instant::now() - Duration::from_secs(60);
             let mut clients: HashMap<SocketAddr, ClientEntry> = HashMap::new();
             let mut cids: HashMap<u32, SocketAddr> = HashMap::new();
@@ -294,6 +330,32 @@ impl RelayServer {
                     client_gates.retain(|a, _| clients.contains_key(a));
                     thread_binds.lock().unwrap_or_else(|e| e.into_inner()).prune();
                     host_gates.retain(|_, g| g.start.elapsed() < Duration::from_secs(10));
+                    slots.retain(|_, t| hosts.contains_key(t));
+                }
+
+                while let Ok((port, data, from)) = slot_rx.try_recv() {
+                    let Some(token) = slots.get(&port).copied() else { continue };
+                    let Some((host, _)) = hosts.get(&token) else { continue };
+                    let cid = match clients.get(&from) {
+                        Some(c) if c.token == token => c.cid,
+                        _ => {
+                            if clients.len() >= MAX_CLIENTS {
+                                continue;
+                            }
+                            let id = next_cid;
+                            next_cid = next_cid.wrapping_add(1).max(1);
+                            cids.insert(id, from);
+                            clients.insert(from, ClientEntry { token, cid: id, last: Instant::now(), open: true });
+                            id
+                        }
+                    };
+                    if let Some(c) = clients.get_mut(&from) {
+                        c.last = Instant::now();
+                        c.open = true;
+                    }
+                    let mut payload = cid.to_be_bytes().to_vec();
+                    payload.extend_from_slice(&frame(T_OPEN, &data));
+                    let _ = sock.send_to(&frame(T_TO_HOST, &payload), host);
                 }
 
                 let (n, src) = match sock.recv_from(&mut buf) {
@@ -354,9 +416,42 @@ impl RelayServer {
                         let mut token = [0u8; 16];
                         token.copy_from_slice(body);
                         let registered = hosts.get(&token).map_or(false, |(a, t)| *a == src && t.elapsed() < HOST_TTL);
-                        if registered {
-                            open_hosts.insert(token);
+                        if !registered {
+                            continue;
                         }
+                        open_hosts.insert(token);
+                        if ingress == 0 {
+                            continue;
+                        }
+                        let assigned = slots.iter().find(|(_, t)| **t == token).map(|(p, _)| *p);
+                        let port = match assigned {
+                            Some(p) => p,
+                            None => {
+                                if slots.len() >= ingress {
+                                    let _ = sock.send_to(&frame(T_SLOT, &0u16.to_be_bytes()), src);
+                                    continue;
+                                }
+                                let mut found = 0;
+                                for i in 1..=ingress {
+                                    let p = match base_port.checked_add(i as u16) {
+                                        Some(p) => p,
+                                        None => continue,
+                                    };
+                                    if !slots.contains_key(&p) {
+                                        found = p;
+                                        break;
+                                    }
+                                }
+                                if found == 0 {
+                                    let _ = sock.send_to(&frame(T_SLOT, &0u16.to_be_bytes()), src);
+                                    continue;
+                                }
+                                slots.insert(found, token);
+                                log(&format!("game slot udp/{} assigned", found));
+                                found
+                            }
+                        };
+                        let _ = sock.send_to(&frame(T_SLOT, &port.to_be_bytes()), src);
                     }
                     T_OPEN if body.len() == 16 => {
                         let mut token = [0u8; 16];
@@ -609,6 +704,22 @@ fn run_host_agent_on<L>(
 where
     L: Fn(&str, &str),
 {
+    run_host_agent_slot(relay, identity, studio_port, stop, players, open_ingress, None, log)
+}
+
+pub fn run_host_agent_slot<L>(
+    relay: SocketAddr,
+    identity: Identity,
+    studio_port: u16,
+    stop: Arc<AtomicBool>,
+    players: Arc<AtomicUsize>,
+    open_ingress: bool,
+    game_port: Option<Arc<AtomicUsize>>,
+    log: L,
+) -> io::Result<()>
+where
+    L: Fn(&str, &str),
+{
     let sock = Arc::new(UdpSocket::bind("0.0.0.0:0")?);
     sock.connect(relay)?;
     sock.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -652,6 +763,17 @@ where
                 }
                 if open_ingress {
                     let _ = sock.send(&frame(T_OPEN_HOST, &identity.token()));
+                }
+            }
+            T_SLOT if n == 7 => {
+                let port = u16::from_be_bytes([buf[5], buf[6]]);
+                if let Some(slot) = &game_port {
+                    slot.store(port as usize, Ordering::Relaxed);
+                }
+                if port == 0 {
+                    log("Relay has no free game port; plain Neptunnel players cannot join.", "warn");
+                } else {
+                    log(&format!("Game port {} assigned by the relay.", port), "ok");
                 }
             }
             T_TO_HOST if n >= 9 => {
@@ -792,6 +914,68 @@ mod tests {
 
     fn free_port() -> u16 {
         UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn slot_lets_two_open_hosts_coexist() {
+        let base = free_port();
+        if base > 60000 {
+            return;
+        }
+        let listen: SocketAddr = ([127, 0, 0, 1], base).into();
+        let studio_a = free_port();
+        let studio_b = free_port();
+        let echo_a = spawn_echo(studio_a);
+        let echo_b = spawn_echo(studio_b);
+
+        let mut relay = RelayServer::start_with_ingress(listen, 2, |_| {}).unwrap();
+
+        let id_a = Identity::ephemeral();
+        let id_b = Identity::ephemeral();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sa, sb) = (Arc::clone(&stop), Arc::clone(&stop));
+        let (ia, ib) = (id_a.clone(), id_b.clone());
+        let slot_a = Arc::new(AtomicUsize::new(0));
+        let slot_b = Arc::new(AtomicUsize::new(0));
+        let (ga, gb) = (Arc::clone(&slot_a), Arc::clone(&slot_b));
+        let a = thread::spawn(move || {
+            run_host_agent_slot(listen, ia, studio_a, sa, Arc::new(AtomicUsize::new(0)), true, Some(ga), |_, _| {})
+        });
+        let b = thread::spawn(move || {
+            run_host_agent_slot(listen, ib, studio_b, sb, Arc::new(AtomicUsize::new(0)), true, Some(gb), |_, _| {})
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && (slot_a.load(Ordering::Relaxed) == 0 || slot_b.load(Ordering::Relaxed) == 0) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        let pa = slot_a.load(Ordering::Relaxed);
+        let pb = slot_b.load(Ordering::Relaxed);
+        assert!(pa != 0 && pb != 0, "relay did not assign both game slots");
+        assert_ne!(pa, pb, "both hosts got the same game slot");
+
+        for (port, want) in [(pa as u16, "host-a"), (pb as u16, "host-b")] {
+            let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+            c.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let mut got = false;
+            let deadline = Instant::now() + Duration::from_secs(6);
+            while Instant::now() < deadline && !got {
+                let _ = c.send_to(want.as_bytes(), addr);
+                let mut b = [0u8; 128];
+                if let Ok(n) = c.recv(&mut b) {
+                    got = b[..n] == want.as_bytes()[..];
+                }
+            }
+            assert!(got, "slot {} did not reach its own host", port);
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = a.join();
+        let _ = b.join();
+        echo_a.store(false, Ordering::SeqCst);
+        echo_b.store(false, Ordering::SeqCst);
+        relay.stop();
     }
 
     #[test]

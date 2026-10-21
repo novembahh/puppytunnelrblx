@@ -6,7 +6,7 @@ use crate::config::{
 };
 use crate::identity::Identity;
 use crate::master::{self, Announce, RemoteServer};
-use crate::net::relay::{make_invite, parse_invite, run_host_agent};
+use crate::net::relay::{make_invite, parse_invite};
 use crate::net::{
     run_connectivity_test, run_echo_test, start_proxy, start_proxy_relay, udp_port_in_use, warm_tunnel, EchoServer,
     ProxyHandle,
@@ -183,6 +183,9 @@ pub struct NepApp {
     agent_thread: Option<thread::JoinHandle<()>>,
     invite: Option<String>,
     raw_join: Option<String>,
+    game_port: Arc<AtomicUsize>,
+    game_port_poll: Option<Instant>,
+    game_token: crate::net::relay::Token,
     players: Arc<AtomicUsize>,
     announcer: Option<thread::JoinHandle<()>>,
     announce_ready: Arc<AtomicBool>,
@@ -284,6 +287,9 @@ impl NepApp {
             agent_thread: None,
             invite: None,
             raw_join: None,
+            game_port: Arc::new(AtomicUsize::new(0)),
+            game_port_poll: None,
+            game_token: [0u8; 16],
             players: Arc::new(AtomicUsize::new(0)),
             announcer: None,
             announce_ready: Arc::new(AtomicBool::new(cfg!(not(target_os = "linux")))),
@@ -441,6 +447,7 @@ impl eframe::App for NepApp {
             self.screen = Screen::Join;
         }
         self.poll_server_process();
+        self.poll_game_port();
 
         self.community_state.local_headshot = self.headshot.clone();
         self.community_state.local_avatar = self.avatar_tex.clone();
@@ -1124,22 +1131,27 @@ impl NepApp {
         let players = Arc::clone(&self.players);
         let agent_id = id.clone();
         let open = self.config.nep_compat;
+        self.game_port.store(0, Ordering::Relaxed);
+        self.game_token = id.token();
+        let slot = Arc::clone(&self.game_port);
         self.agent_thread = Some(thread::spawn(move || {
-            let res = if open {
-                crate::net::relay::run_host_agent_open(addr, agent_id, studio_port, stop, players, &sink)
-            } else {
-                run_host_agent(addr, agent_id, studio_port, stop, players, &sink)
-            };
+            let res = crate::net::relay::run_host_agent_slot(
+                addr,
+                agent_id,
+                studio_port,
+                stop,
+                players,
+                open,
+                Some(slot),
+                &sink,
+            );
             if let Err(e) = res {
                 sink(&format!("Relay stopped: {}", e), "err");
             }
         }));
         if self.config.nep_compat {
-            let relay_port: u16 = relay.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(7777);
-            let addr = crate::net::relay::game_address(&self.config.game_host, &id.token(), relay_port);
-            let shown = if addr.is_empty() { relay.clone() } else { addr };
-            self.add_log(&format!("Neptunnel players join with {}", shown), "ok");
-            self.raw_join = Some(shown);
+            self.game_port_poll = Some(Instant::now());
+            self.add_log("Waiting for the relay to hand out a game port.", "dim");
         }
         if self.config.list_public {
             let name = if self.config.server_name.trim().is_empty() {
@@ -1178,6 +1190,30 @@ impl NepApp {
         copy_text(&invite);
         self.add_log("Invite copied to the clipboard.", "ok");
         self.invite = Some(invite);
+    }
+
+    fn poll_game_port(&mut self) {
+        if self.game_port_poll.is_none() {
+            return;
+        }
+        if self.raw_join.is_some() {
+            self.game_port_poll = None;
+            return;
+        }
+        let port = self.game_port.load(Ordering::Relaxed);
+        if port == 0 {
+            if self.game_port_poll.map_or(false, |t| t.elapsed() > Duration::from_secs(12)) {
+                self.game_port_poll = None;
+                self.add_log("Relay did not assign a game port; plain Neptunnel players cannot join.", "warn");
+            }
+            return;
+        }
+        self.game_port_poll = None;
+        let relay = self.config.relay.trim().to_string();
+        let addr = crate::net::relay::game_address(&self.config.game_host, &self.game_token, port as u16);
+        let shown = if addr.is_empty() { relay } else { addr };
+        self.add_log(&format!("Neptunnel players join with {}", shown), "ok");
+        self.raw_join = Some(shown);
     }
 
     fn render_host_running(&mut self, ui: &mut egui::Ui) {
