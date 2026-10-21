@@ -182,6 +182,7 @@ pub struct NepApp {
     agent_stop: Arc<AtomicBool>,
     agent_thread: Option<thread::JoinHandle<()>>,
     invite: Option<String>,
+    raw_join: Option<String>,
     players: Arc<AtomicUsize>,
     announcer: Option<thread::JoinHandle<()>>,
     announce_ready: Arc<AtomicBool>,
@@ -282,6 +283,7 @@ impl NepApp {
             agent_stop: Arc::new(AtomicBool::new(false)),
             agent_thread: None,
             invite: None,
+            raw_join: None,
             players: Arc::new(AtomicUsize::new(0)),
             announcer: None,
             announce_ready: Arc::new(AtomicBool::new(cfg!(not(target_os = "linux")))),
@@ -351,6 +353,7 @@ impl NepApp {
             let _ = t.join();
         }
         self.invite = None;
+        self.raw_join = None;
         self.server_live = false;
         self.boombox_server.stop();
     }
@@ -1011,6 +1014,11 @@ impl NepApp {
             card(ui, Some("Options"), |ui| {
                 toggle(ui, &mut self.host_media, "Run the media helper");
                 toggle(ui, &mut self.config.list_public, "List in the server browser");
+                toggle(ui, &mut self.config.nep_compat, "Accept plain Neptunnel players");
+                if self.config.nep_compat {
+                    field(ui, "Game address zone", &mut self.config.game_host, "games.puppytunnel.vip");
+                    ui.label(RichText::new(lc("neptunnel players join with <session>.zone:port instead of a puppy:// invite. the relay must point that wildcard at itself.")).size(12.0).color(DIM));
+                }
                 toggle(ui, &mut self.config.native_dialogs, "Use the system file dialog");
                 if self.config.list_public {
                     ui.add_space(8.0);
@@ -1115,11 +1123,24 @@ impl NepApp {
         let sink = self.log_sink();
         let players = Arc::clone(&self.players);
         let agent_id = id.clone();
+        let open = self.config.nep_compat;
         self.agent_thread = Some(thread::spawn(move || {
-            if let Err(e) = run_host_agent(addr, agent_id, studio_port, stop, players, &sink) {
+            let res = if open {
+                crate::net::relay::run_host_agent_open(addr, agent_id, studio_port, stop, players, &sink)
+            } else {
+                run_host_agent(addr, agent_id, studio_port, stop, players, &sink)
+            };
+            if let Err(e) = res {
                 sink(&format!("Relay stopped: {}", e), "err");
             }
         }));
+        if self.config.nep_compat {
+            let relay_port: u16 = relay.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(7777);
+            let addr = crate::net::relay::game_address(&self.config.game_host, &id.token(), relay_port);
+            let shown = if addr.is_empty() { relay.clone() } else { addr };
+            self.add_log(&format!("Neptunnel players join with {}", shown), "ok");
+            self.raw_join = Some(shown);
+        }
         if self.config.list_public {
             let name = if self.config.server_name.trim().is_empty() {
                 format!("{}'s server", self.config.uid)
@@ -1177,6 +1198,26 @@ impl NepApp {
             ui.label(muted(format!("{} connected", self.players.load(Ordering::Relaxed))));
         }
         ui.add_space(12.0);
+
+        if let Some(raw) = self.raw_join.clone() {
+            egui::Frame::none()
+                .fill(CARD)
+                .rounding(14.0)
+                .inner_margin(Margin::symmetric(16.0, 12.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(muted("neptunnel players join with"));
+                        ui.label(RichText::new(&raw).monospace().size(12.5).color(INK));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if secondary(ui, "Copy address") {
+                                copy_text(&raw);
+                            }
+                        });
+                    });
+                });
+            ui.add_space(8.0);
+        }
 
         if let Some(inv) = self.invite.clone() {
             egui::Frame::none()

@@ -114,6 +114,8 @@ enum Cmd {
         allow_private_relays: bool,
         #[arg(long)]
         data_dir: Option<PathBuf>,
+        #[arg(long, value_names = ["LO", "HI"])]
+        public_ports: Vec<u16>,
     },
     Master {
         #[arg(long)]
@@ -260,7 +262,7 @@ fn main() {
         || args.echo_client.is_some()
         || args.test.is_some();
 
-    let mut relay_listen = None;
+    let mut relay_listen: Option<(String, Option<String>, Option<(u16, u16)>, master::MasterOptions)> = None;
     let mut doctor = false;
     let mut profile_cmd = None;
     let mut master_cmd: Option<(String, master::MasterOptions)> = None;
@@ -269,8 +271,16 @@ fn main() {
     if let Some(cmd) = args.cmd.take() {
         headless = true;
         match cmd {
-            Cmd::Relay { listen, with_master, trust_proxy, peer, allow_private_relays, data_dir, strict_profiles } => {
-                relay_listen = Some((listen, with_master, master::MasterOptions { trust_proxy, peers: peer, allow_private_relays, strict_profiles, roblox_api: None, persist_profiles_cache: true, data_dir: data_dir.clone(), ..Default::default() }))
+            Cmd::Relay { listen, with_master, trust_proxy, peer, allow_private_relays, data_dir, strict_profiles, public_ports } => {
+                let public = match public_ports.as_slice() {
+                    [lo, hi] if lo <= hi => Some((*lo, *hi)),
+                    [] => None,
+                    _ => {
+                        eprintln!("--public-ports takes exactly two values: LO HI (LO <= HI)");
+                        return;
+                    }
+                };
+                relay_listen = Some((listen, with_master, public, master::MasterOptions { trust_proxy, peers: peer, allow_private_relays, strict_profiles, roblox_api: None, persist_profiles_cache: true, data_dir: data_dir.clone(), ..Default::default() }))
             }
             Cmd::Master { listen, trust_proxy, peer, allow_private_relays, data_dir, strict_profiles } => {
                 master_cmd = Some((listen, master::MasterOptions { trust_proxy, peers: peer, allow_private_relays, strict_profiles, roblox_api: None, persist_profiles_cache: true, data_dir: data_dir.clone(), ..Default::default() }))
@@ -315,8 +325,8 @@ fn main() {
     }
 
     if headless {
-        let code = if let Some((listen, with_master, opts)) = relay_listen {
-            run_relay(&listen, with_master.as_deref(), opts)
+        let code = if let Some((listen, with_master, public, opts)) = relay_listen {
+            run_relay(&listen, with_master.as_deref(), public, opts)
         } else if let Some((listen, opts)) = master_cmd {
             run_master(&listen, opts)
         } else if let Some((query, tag, sort)) = browse {
@@ -496,7 +506,12 @@ fn run_fleet(args: Cli, count: u16, stagger: u64) -> i32 {
     0
 }
 
-fn run_relay(listen: &str, with_master: Option<&str>, opts: master::MasterOptions) -> i32 {
+fn run_relay(
+    listen: &str,
+    with_master: Option<&str>,
+    public: Option<(u16, u16)>,
+    opts: master::MasterOptions,
+) -> i32 {
     let addr: SocketAddr = match listen.parse() {
         Ok(a) => a,
         Err(_) => {
@@ -522,6 +537,9 @@ fn run_relay(listen: &str, with_master: Option<&str>, opts: master::MasterOption
         Ok(mut relay) => {
             println!("[{}] Relay listening on udp://{}. Ctrl+C to stop.", ts(), addr);
             println!("[{}] Open this UDP port on the VPS firewall. Hosts run: puppytunnel host --relay <this-ip>:{}", ts(), addr.port());
+            if public.is_some() {
+                println!("[{}] Neptunnel-compatible hosts share this same UDP port; players join by host:port.", ts());
+            }
             sleep_until_stopped(&stop);
             relay.stop();
             drop(master);
@@ -1278,11 +1296,26 @@ fn run_host(config: &config::AppConfig, studio: &str, nep: bool, stop: &Arc<Atom
         let st = Arc::clone(&svc);
         let pl = Arc::clone(&players);
         let agent_id = id.clone();
+        let open = config.nep_compat;
         agent = Some(std::thread::spawn(move || {
-            if let Err(e) = run_host_agent(addr, agent_id, studio_port, st, pl, log_line) {
+            let res = if open {
+                net::relay::run_host_agent_open(addr, agent_id, studio_port, st, pl, log_line)
+            } else {
+                run_host_agent(addr, agent_id, studio_port, st, pl, log_line)
+            };
+            if let Err(e) = res {
                 eprintln!("relay agent stopped: {}", e);
             }
         }));
+        if config.nep_compat {
+            let relay_port: u16 = relay.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(7777);
+            let addr = net::relay::game_address(&config.game_host, &id.token(), relay_port);
+            if addr.is_empty() {
+                println!("[{}] Neptunnel players join with {}", ts(), relay);
+            } else {
+                println!("[{}] Neptunnel players join with {}", ts(), addr);
+            }
+        }
         if config.list_public {
             let name = if config.server_name.trim().is_empty() { format!("{}'s server", config.uid) } else { config.server_name.clone() };
             let (host, host_sig) = profile::host_binding(config, &id);

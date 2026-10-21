@@ -90,6 +90,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub list_public: bool,
     #[serde(default)]
+    pub nep_compat: bool,
+    #[serde(default)]
+    pub game_host: String,
+    #[serde(default)]
     pub native_dialogs: bool,
     #[serde(default)]
     pub server_secret: String,
@@ -155,6 +159,8 @@ impl Default for AppConfig {
             server_tags: String::new(),
             max_players: 0,
             list_public: false,
+            nep_compat: false,
+            game_host: String::new(),
             native_dialogs: false,
             server_secret: String::new(),
             roblox_id: 0,
@@ -299,6 +305,12 @@ pub fn load_config() -> AppConfig {
             }
             if let Some(v) = parsed.get("list_public").and_then(|v| v.as_bool()) {
                 config.list_public = v;
+            }
+            if let Some(v) = parsed.get("nep_compat").and_then(|v| v.as_bool()) {
+                config.nep_compat = v;
+            }
+            if let Some(v) = parsed.get("game_host").and_then(|v| v.as_str()) {
+                config.game_host = v.to_string();
             }
             if let Some(v) = parsed.get("overhead_tags").and_then(|v| v.as_bool()) {
                 config.overhead_tags = v;

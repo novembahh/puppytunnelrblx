@@ -21,14 +21,29 @@ pub const T_ACK_HOST: u8 = 0x81;
 pub const T_ACK_CLIENT: u8 = 0x82;
 pub const T_S_DATA: u8 = 0x83;
 pub const T_NO_HOST: u8 = 0x84;
+pub const T_OPEN: u8 = 0x07;
+pub const T_OPEN_HOST: u8 = 0x0a;
 
 const HOST_TTL: Duration = Duration::from_secs(30);
 const CLIENT_TTL: Duration = Duration::from_secs(30);
 const REG_MAX_SKEW_SECS: u64 = 300;
 const MAX_CLIENTS: usize = 1024;
 const MAX_HOSTS: usize = 256;
+const MAX_OPEN: usize = 64;
 const MAX_FORWARD_PER_SEC: u32 = 120;
 const MAX_FORWARD_BYTES: usize = 8192;
+
+pub fn session_label(token: &Token) -> String {
+    token_hex(token)[..10].to_string()
+}
+
+pub fn game_address(zone: &str, token: &Token, port: u16) -> String {
+    let zone = zone.trim().trim_matches('.');
+    if zone.is_empty() {
+        return String::new();
+    }
+    format!("{}.{}:{}", session_label(token), zone, port)
+}
 
 pub fn forward_payload_ok(len: usize) -> bool {
     len <= MAX_FORWARD_BYTES
@@ -187,10 +202,55 @@ fn is_transient(e: &io::Error) -> bool {
     ) || e.raw_os_error() == Some(10054)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn route_unframed(
+    sock: &UdpSocket,
+    hosts: &mut HashMap<Token, (SocketAddr, Instant)>,
+    open_hosts: &mut std::collections::HashSet<Token>,
+    clients: &mut HashMap<SocketAddr, ClientEntry>,
+    cids: &mut HashMap<u32, SocketAddr>,
+    next_cid: &mut u32,
+    n: usize,
+    src: SocketAddr,
+    buf: &mut [u8],
+    last_warn: &mut Instant,
+) {
+    open_hosts.retain(|t| hosts.contains_key(t));
+    let mut live = open_hosts.iter().filter_map(|t| hosts.get(t).map(|(a, _)| (*t, *a)));
+    let Some((token, host)) = live.next() else { return };
+    if live.next().is_some() {
+        if last_warn.elapsed() >= Duration::from_secs(10) {
+            *last_warn = Instant::now();
+            eprintln!("relay: unframed Neptunnel traffic dropped, more than one open host is registered");
+        }
+        return;
+    }
+    let cid = match clients.get(&src) {
+        Some(c) if c.token == token => c.cid,
+        _ => {
+            if clients.len() >= MAX_CLIENTS {
+                return;
+            }
+            let id = *next_cid;
+            *next_cid = next_cid.wrapping_add(1).max(1);
+            cids.insert(id, src);
+            clients.insert(src, ClientEntry { token, cid: id, last: Instant::now(), open: true });
+            id
+        }
+    };
+    if let Some(c) = clients.get_mut(&src) {
+        c.last = Instant::now();
+    }
+    let mut payload = cid.to_be_bytes().to_vec();
+    payload.extend_from_slice(&frame(T_OPEN, &buf[..n]));
+    let _ = sock.send_to(&frame(T_TO_HOST, &payload), host);
+}
+
 struct ClientEntry {
     token: Token,
     cid: u32,
     last: Instant,
+    open: bool,
 }
 
 pub struct RelayServer {
@@ -213,6 +273,8 @@ impl RelayServer {
         let thread_binds = Arc::clone(&binds);
         let thread = thread::spawn(move || {
             let mut hosts: HashMap<Token, (SocketAddr, Instant)> = HashMap::new();
+            let mut open_hosts: std::collections::HashSet<Token> = std::collections::HashSet::new();
+            let mut last_unframed_warn = Instant::now() - Duration::from_secs(60);
             let mut clients: HashMap<SocketAddr, ClientEntry> = HashMap::new();
             let mut cids: HashMap<u32, SocketAddr> = HashMap::new();
             let mut client_gates: HashMap<SocketAddr, FloodGate> = HashMap::new();
@@ -225,6 +287,7 @@ impl RelayServer {
                 if last_prune.elapsed() >= Duration::from_secs(5) {
                     last_prune = Instant::now();
                     hosts.retain(|_, (_, t)| t.elapsed() < HOST_TTL);
+                    open_hosts.retain(|t| hosts.contains_key(t));
                     clients.retain(|_, c| c.last.elapsed() < CLIENT_TTL);
                     cids.retain(|_, a| clients.contains_key(a));
                     client_gates.retain(|a, _| clients.contains_key(a));
@@ -238,6 +301,10 @@ impl RelayServer {
                     Err(_) => break,
                 };
                 if n < 5 || &buf[..4] != MAGIC {
+                    route_unframed(
+                        &sock, &mut hosts, &mut open_hosts, &mut clients, &mut cids, &mut next_cid,
+                        n, src, &mut buf, &mut last_unframed_warn,
+                    );
                     continue;
                 }
                 let body = &buf[5..n];
@@ -282,6 +349,39 @@ impl RelayServer {
                         reply.extend_from_slice(&count.to_be_bytes());
                         let _ = sock.send_to(&frame(T_STATS_REPLY, &reply), src);
                     }
+                    T_OPEN_HOST if body.len() == 16 => {
+                        let mut token = [0u8; 16];
+                        token.copy_from_slice(body);
+                        let registered = hosts.get(&token).map_or(false, |(a, t)| *a == src && t.elapsed() < HOST_TTL);
+                        if registered {
+                            open_hosts.insert(token);
+                        }
+                    }
+                    T_OPEN if body.len() == 16 => {
+                        let mut token = [0u8; 16];
+                        token.copy_from_slice(body);
+                        let live = hosts.get(&token).map_or(false, |(_, t)| t.elapsed() < HOST_TTL);
+                        if !live {
+                            let _ = sock.send_to(&frame(T_NO_HOST, &[]), src);
+                            continue;
+                        }
+                        let same = clients.get(&src).map(|c| c.token == token && c.open).unwrap_or(false);
+                        if !same {
+                            let open_count = clients.values().filter(|c| c.open).count();
+                            if open_count >= MAX_OPEN || clients.len() >= MAX_CLIENTS {
+                                continue;
+                            }
+                            let cid = next_cid;
+                            next_cid = next_cid.wrapping_add(1).max(1);
+                            cids.insert(cid, src);
+                            clients.insert(src, ClientEntry { token, cid, last: Instant::now(), open: true });
+                            log(&format!("open client joined from {}", src));
+                        }
+                        if let Some(c) = clients.get_mut(&src) {
+                            c.last = Instant::now();
+                        }
+                        let _ = sock.send_to(&frame(T_ACK_CLIENT, &[]), src);
+                    }
                     T_HELLO if body.len() == 16 => {
                         let mut token = [0u8; 16];
                         token.copy_from_slice(body);
@@ -296,7 +396,7 @@ impl RelayServer {
                             let cid = next_cid;
                             next_cid = next_cid.wrapping_add(1).max(1);
                             cids.insert(cid, src);
-                            clients.insert(src, ClientEntry { token, cid, last: Instant::now() });
+                            clients.insert(src, ClientEntry { token, cid, last: Instant::now(), open: false });
                             log(&format!("client joined from {}", src));
                         }
                         if let Some(c) = clients.get_mut(&src) {
@@ -332,7 +432,11 @@ impl RelayServer {
                         entry.last = Instant::now();
                         if let Some((host, _)) = hosts.get(&entry.token) {
                             let mut payload = entry.cid.to_be_bytes().to_vec();
-                            payload.extend_from_slice(body);
+                            if entry.open {
+                                payload.extend_from_slice(&frame(T_OPEN, body));
+                            } else {
+                                payload.extend_from_slice(body);
+                            }
                             let _ = sock.send_to(&frame(T_TO_HOST, &payload), host);
                         }
                     }
@@ -469,6 +573,35 @@ pub fn run_host_agent<L>(
 where
     L: Fn(&str, &str),
 {
+    run_host_agent_on(relay, identity, studio_port, stop, players, false, log)
+}
+
+pub fn run_host_agent_open<L>(
+    relay: SocketAddr,
+    identity: Identity,
+    studio_port: u16,
+    stop: Arc<AtomicBool>,
+    players: Arc<AtomicUsize>,
+    log: L,
+) -> io::Result<()>
+where
+    L: Fn(&str, &str),
+{
+    run_host_agent_on(relay, identity, studio_port, stop, players, true, log)
+}
+
+fn run_host_agent_on<L>(
+    relay: SocketAddr,
+    identity: Identity,
+    studio_port: u16,
+    stop: Arc<AtomicBool>,
+    players: Arc<AtomicUsize>,
+    open_ingress: bool,
+    log: L,
+) -> io::Result<()>
+where
+    L: Fn(&str, &str),
+{
     let sock = Arc::new(UdpSocket::bind("0.0.0.0:0")?);
     sock.connect(relay)?;
     sock.set_read_timeout(Some(Duration::from_millis(500)))?;
@@ -510,9 +643,18 @@ where
                     connected = true;
                     log("Registered with relay.", "ok");
                 }
+                if open_ingress {
+                    let _ = sock.send(&frame(T_OPEN_HOST, &identity.token()));
+                }
             }
             T_TO_HOST if n >= 9 => {
                 let cid = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
+                let inner = &buf[9..n];
+                let payload = if inner.len() >= 5 && &inner[..4] == MAGIC && inner[4] == T_OPEN {
+                    &inner[5..]
+                } else {
+                    inner
+                };
                 sessions.retain(|_, s| s.alive.load(Ordering::SeqCst));
                 if !sessions.contains_key(&cid) {
                     if sessions.len() >= MAX_CLIENTS {
@@ -564,7 +706,7 @@ where
                 }
                 if let Some(s) = sessions.get(&cid) {
                     s.last_client.store(unix_now(), Ordering::Relaxed);
-                    let _ = s.sock.send(&buf[9..n]);
+                    let _ = s.sock.send(payload);
                 }
             }
             _ => {}
@@ -646,6 +788,17 @@ mod tests {
     }
 
     #[test]
+    fn session_labels_are_stable_and_distinct() {
+        let a = new_token();
+        let b = new_token();
+        assert_eq!(session_label(&a), session_label(&a));
+        assert_ne!(session_label(&a), session_label(&b));
+        assert_eq!(session_label(&a).len(), 10);
+        assert_eq!(game_address("games.puppytunnel.vip", &a, 7777), format!("{}.games.puppytunnel.vip:7777", session_label(&a)));
+        assert!(game_address("", &a, 7777).is_empty());
+    }
+
+    #[test]
     fn invite_round_trip() {
         let t = new_token();
         let inv = make_invite("relay.example.com:7777", &t);
@@ -681,6 +834,62 @@ mod tests {
         sock.send_to(&frame(T_REG, &good), relay_addr).unwrap();
         assert!(sock.recv(&mut b).is_ok());
         assert_eq!(query_stats(relay_addr, &victim.token()), Some((true, 0)));
+        relay.stop();
+    }
+
+    #[test]
+    fn open_client_reaches_studio_as_neptunnel() {
+        let relay_port = free_port();
+        let studio_port = free_port();
+        let relay_addr: SocketAddr = ([127, 0, 0, 1], relay_port).into();
+
+        let mut relay = RelayServer::start(relay_addr, |_| {}).unwrap();
+        let mut echo = EchoServer::new();
+        echo.start(studio_port).unwrap();
+
+        let identity = Identity::ephemeral();
+        let token = identity.token();
+        let stop = Arc::new(AtomicBool::new(false));
+        let st = Arc::clone(&stop);
+        let agent = thread::spawn(move || {
+            run_host_agent_open(relay_addr, identity, studio_port, st, Arc::new(AtomicUsize::new(0)), |_, _| {})
+        });
+
+        for _ in 0..30 {
+            thread::sleep(Duration::from_millis(100));
+            if query_stats(relay_addr, &token).map_or(false, |(reg, _)| reg) {
+                break;
+            }
+        }
+
+        let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        c.send_to(&frame(T_OPEN, &token), relay_addr).unwrap();
+        let mut ack = [0u8; 32];
+        let n = c.recv(&mut ack).expect("no ack for the open client");
+        assert!(n >= 5 && &ack[..5] == &frame(T_ACK_CLIENT, &[])[..]);
+
+        let mut req = ECHO_REQ.to_vec();
+        req.extend_from_slice(b"neptunel");
+        c.send_to(&frame(T_C_DATA, &req), relay_addr).unwrap();
+        let mut b = [0u8; 64];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = false;
+        while Instant::now() < deadline {
+            let n = match c.recv(&mut b) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if n >= 5 && &b[..4] == MAGIC && b[4] == T_S_DATA && b[5..n].starts_with(ECHO_RESP) {
+                got = true;
+                break;
+            }
+        }
+        assert!(got, "plain Neptunnel datagram did not survive the relay");
+
+        stop.store(true, Ordering::SeqCst);
+        agent.join().unwrap().unwrap();
+        echo.stop();
         relay.stop();
     }
 
