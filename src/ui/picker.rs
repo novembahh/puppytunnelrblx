@@ -1,7 +1,10 @@
 
+use crate::ui::icons::Icon;
 use crate::ui::theme::*;
 use crate::ui::widgets::*;
-use eframe::egui::{self, Align, Align2, Color32, Layout, Margin, RichText, Rounding, ScrollArea, Sense, Vec2};
+use eframe::egui::{
+    self, Align, Align2, Color32, FontId, Frame, Layout, Margin, RichText, Rounding, ScrollArea, Sense, Shape, Vec2,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -96,7 +99,7 @@ impl Picker {
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click_and_drag());
-                ui.painter().rect_filled(rect, Rounding::ZERO, Color32::from_black_alpha(170));
+                ui.painter().rect_filled(rect, Rounding::ZERO, Color32::from_black_alpha(150));
             });
 
         let mut result = PickResult::Open;
@@ -105,14 +108,22 @@ impl Picker {
             .order(egui::Order::Tooltip)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(CARD)
-                    .rounding(20.0)
-                    .inner_margin(Margin::same(22.0))
+                let shadow = ui.painter().add(Shape::Noop);
+                let back = ui.painter().add(Shape::Noop);
+                let resp = Frame::none()
+                    .rounding(Rounding::same(R_PANE))
+                    .inner_margin(Margin::same(20.0))
                     .show(ui, |ui| {
                         ui.set_width(width);
-                        ui.label(RichText::new(self.title).size(20.0).color(INK));
-                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(self.title).size(T_TITLE).color(BONE));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if icon_button(ui, Icon::Close, "close") {
+                                    result = PickResult::Cancel;
+                                }
+                            });
+                        });
+                        ui.add_space(12.0);
 
                         let id = egui::Id::new("picker_path");
                         let r = text_input(ui, id, &mut self.path_text, "Path", f32::INFINITY);
@@ -122,41 +133,48 @@ impl Picker {
                                 self.go(p);
                             }
                         }
-                        ui.add_space(6.0);
+                        ui.add_space(8.0);
 
                         let (dirs, files) = self.entries();
                         let mut navigate = None;
                         let mut pick = None;
                         let mut accept = false;
-                        ScrollArea::vertical().id_salt("picker_scroll_1").max_height(300.0).auto_shrink([false, false]).show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            if !self.dir.as_os_str().is_empty() {
-                                let up = self.dir.parent().map(Path::to_path_buf).unwrap_or_default();
-                                if list_row(ui, "..", false, false).clicked() {
-                                    navigate = Some(up);
+                        ScrollArea::vertical()
+                            .id_salt("picker_scroll_1")
+                            .max_height(300.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                if !self.dir.as_os_str().is_empty() {
+                                    let up = self.dir.parent().map(Path::to_path_buf).unwrap_or_default();
+                                    if list_row(ui, "..", true, false, true).clicked() {
+                                        navigate = Some(up);
+                                    }
                                 }
-                            }
-                            for d in &dirs {
-                                let name = d.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| d.to_string_lossy().to_string());
-                                if list_row(ui, &format!("{}", name), true, false).clicked() {
-                                    navigate = Some(d.clone());
+                                for d in &dirs {
+                                    let name = d
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| d.to_string_lossy().to_string());
+                                    if list_row(ui, &name, true, false, false).clicked() {
+                                        navigate = Some(d.clone());
+                                    }
                                 }
-                            }
-                            for f in &files {
-                                let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                                let sel = self.selected.contains(f);
-                                let resp = list_row(ui, &name, false, sel);
-                                if resp.clicked() {
-                                    pick = Some(f.clone());
+                                for f in &files {
+                                    let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                                    let sel = self.selected.contains(f);
+                                    let resp = list_row(ui, &name, false, sel, false);
+                                    if resp.clicked() {
+                                        pick = Some(f.clone());
+                                    }
+                                    if resp.double_clicked() && !self.multi {
+                                        accept = true;
+                                    }
                                 }
-                                if resp.double_clicked() && !self.multi {
-                                    accept = true;
+                                if dirs.is_empty() && files.is_empty() {
+                                    empty_state(ui, Icon::Cube, "nothing here", "");
                                 }
-                            }
-                            if dirs.is_empty() && files.is_empty() {
-                                ui.label(muted("Nothing here."));
-                            }
-                        });
+                            });
 
                         if let Some(d) = navigate {
                             self.go(d);
@@ -174,51 +192,72 @@ impl Picker {
                         }
 
                         ui.add_space(12.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let label = if self.multi && self.selected.len() > 1 {
-                                format!("Select {}", self.selected.len())
-                            } else {
-                                "Select".to_string()
-                            };
-                            if primary(ui, &label, !self.selected.is_empty()) || accept {
-                                result = PickResult::Done(self.target, self.selected.clone());
+                        ui.horizontal(|ui| {
+                            if self.multi {
+                                ui.label(RichText::new(format!("{} selected", self.selected.len())).size(T_META).color(TX_FAINT));
+                            } else if let Some(first) = self.selected.first() {
+                                let name = first.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                                ui.label(RichText::new(name).size(T_META).color(TX_DIM));
                             }
-                            if secondary(ui, "Cancel") {
-                                result = PickResult::Cancel;
-                            }
-                            if secondary(ui, "System dialog") {
-                                result = PickResult::Native(self.target);
-                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let label = if self.multi && self.selected.len() > 1 {
+                                    format!("Select {}", self.selected.len())
+                                } else {
+                                    "Select".to_string()
+                                };
+                                if primary(ui, &label, !self.selected.is_empty()) || accept {
+                                    result = PickResult::Done(self.target, self.selected.clone());
+                                }
+                                if secondary(ui, "Cancel") {
+                                    result = PickResult::Cancel;
+                                }
+                                if quiet(ui, "system dialog") {
+                                    result = PickResult::Native(self.target);
+                                }
+                            });
                         });
                     });
+                let rect = resp.response.rect;
+                ui.painter().set(shadow, soft_shadow_shape(rect, R_PANE, 1.2));
+                ui.painter().set(back, surface_shape(rect, R_PANE, SURF_2, 0.03));
             });
         result
     }
 }
 
-fn list_row(ui: &mut egui::Ui, text: &str, folder: bool, selected: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
+fn list_row(ui: &mut egui::Ui, text: &str, folder: bool, selected: bool, up: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    if selected {
-        ui.painter().rect_filled(rect, Rounding::same(10.0), FIELD_HI);
-    } else if resp.hovered() {
-        ui.painter().rect_filled(rect, Rounding::same(10.0), FIELD);
+    if selected || resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, Rounding::same(R_SM), if selected { SURF_3 } else { SURF_1 });
     }
     let color = if selected {
-        MINT
-    } else if folder {
-        INK
+        BONE
+    } else if folder || up {
+        TX
     } else {
-        DIM
+        TX_DIM
     };
-    let label = if folder { format!("{}/", text) } else { text.to_string() };
+    let glyph = if up {
+        Icon::Refresh
+    } else if folder {
+        Icon::Cube
+    } else {
+        Icon::External
+    };
+    crate::ui::icons::paint(ui.painter(), rect.left_center() + Vec2::new(16.0, 0.0), 14.0, glyph, color);
+    let label = if folder && !up { format!("{}/", text) } else { text.to_string() };
     ui.painter().text(
-        rect.left_center() + Vec2::new(12.0, 0.0),
+        rect.left_center() + Vec2::new(32.0, 0.0),
         Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(14.0),
+        FontId::proportional(T_BODY),
         color,
     );
+    if selected {
+        crate::ui::icons::paint(ui.painter(), rect.right_center() - Vec2::new(16.0, 0.0), 14.0, Icon::Check, BONE);
+    }
     if resp.clicked() {
         crate::ui::sound::play_click();
     }

@@ -78,6 +78,17 @@ impl UpdateState {
         matches!(self, UpdateState::ReadyToInstall(..))
     }
 
+    pub fn has_release(&self) -> bool {
+        matches!(self, UpdateState::Available(_) | UpdateState::ReadyToInstall(..))
+    }
+
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            UpdateState::Checking | UpdateState::Downloading { .. } | UpdateState::Installing
+        )
+    }
+
     pub fn status_text(&self) -> String {
         match self {
             UpdateState::Idle => "Idle".to_string(),
@@ -174,6 +185,14 @@ impl UpdateManager {
 
     pub fn state(&self) -> UpdateState {
         self.state.lock().unwrap().clone()
+    }
+
+    pub fn has_release(&self) -> bool {
+        self.state.lock().map_or(false, |s| s.has_release())
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.state.lock().map_or(false, |s| s.is_busy())
     }
 
     pub fn set_state(&self, new_state: UpdateState) {

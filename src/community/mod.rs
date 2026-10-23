@@ -10,6 +10,7 @@ pub mod permissions;
 pub mod realtime;
 pub mod security;
 pub mod types;
+pub mod worker;
 
 pub use e2ee::{
     decrypt_direct_message, decrypt_group_message, derive_x25519_secret, encrypt_direct_message,

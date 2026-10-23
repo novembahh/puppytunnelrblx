@@ -1,5 +1,6 @@
 use crate::identity::{reg_message, token_of, unix_now, verify, Identity};
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -24,6 +25,7 @@ pub const T_NO_HOST: u8 = 0x84;
 pub const T_OPEN: u8 = 0x07;
 pub const T_OPEN_HOST: u8 = 0x0a;
 pub const T_SLOT: u8 = 0x8a;
+pub const DEFAULT_GAME_ZONE: &str = "games.puppytunnel.vip";
 
 const HOST_TTL: Duration = Duration::from_secs(30);
 const CLIENT_TTL: Duration = Duration::from_secs(30);
@@ -40,10 +42,45 @@ pub fn session_label(token: &Token) -> String {
 
 pub fn game_address(zone: &str, token: &Token, port: u16) -> String {
     let zone = zone.trim().trim_matches('.');
-    if zone.is_empty() {
+    if zone.is_empty() || port == 0 || !valid_game_domain(zone) {
         return String::new();
     }
     format!("{}.{}:{}", session_label(token), zone, port)
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GameDomain {
+    #[serde(default)]
+    pub zone: String,
+    #[serde(default)]
+    pub host: String,
+}
+
+impl GameDomain {
+    pub fn is_empty(&self) -> bool {
+        self.zone.trim().is_empty() && self.host.trim().is_empty()
+    }
+
+    pub fn address(&self, token: &Token, port: u16) -> String {
+        let host = self.host.trim().trim_matches('.');
+        if !host.is_empty() {
+            return if port == 0 { String::new() } else { format!("{}:{}", host, port) };
+        }
+        game_address(&self.zone, token, port)
+    }
+}
+
+pub fn valid_game_domain(raw: &str) -> bool {
+    let domain = raw.trim().trim_matches('.');
+    !domain.is_empty()
+        && domain.len() <= 120
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 pub fn forward_payload_ok(len: usize) -> bool {
@@ -208,6 +245,7 @@ fn route_unframed(
     sock: &UdpSocket,
     hosts: &mut HashMap<Token, (SocketAddr, Instant)>,
     open_hosts: &mut std::collections::HashSet<Token>,
+    shared: Option<Token>,
     clients: &mut HashMap<SocketAddr, ClientEntry>,
     cids: &mut HashMap<u32, SocketAddr>,
     next_cid: &mut u32,
@@ -217,15 +255,22 @@ fn route_unframed(
     last_warn: &mut Instant,
 ) {
     open_hosts.retain(|t| hosts.contains_key(t));
-    let mut live = open_hosts.iter().filter_map(|t| hosts.get(t).map(|(a, _)| (*t, *a)));
-    let Some((token, host)) = live.next() else { return };
-    if live.next().is_some() {
-        if last_warn.elapsed() >= Duration::from_secs(10) {
-            *last_warn = Instant::now();
-            eprintln!("relay: unframed Neptunnel traffic dropped, more than one open host is registered");
+    let token = match shared {
+        Some(t) => t,
+        None => {
+            let mut live = open_hosts.iter().copied();
+            let Some(first) = live.next() else { return };
+            if live.next().is_some() {
+                if last_warn.elapsed() >= Duration::from_secs(10) {
+                    *last_warn = Instant::now();
+                    eprintln!("relay: unframed Neptunnel traffic dropped, more than one open host is registered");
+                }
+                return;
+            }
+            first
         }
-        return;
-    }
+    };
+    let Some(host) = hosts.get(&token).map(|(a, _)| *a) else { return };
     let cid = match clients.get(&src) {
         Some(c) if c.token == token => c.cid,
         _ => {
@@ -284,15 +329,18 @@ impl RelayServer {
             let mut hosts: HashMap<Token, (SocketAddr, Instant)> = HashMap::new();
             let mut open_hosts: std::collections::HashSet<Token> = std::collections::HashSet::new();
             let mut slots: HashMap<u16, Token> = HashMap::new();
+            let mut shared: Option<Token> = None;
             let (slot_tx, slot_rx) = std::sync::mpsc::channel::<(u16, Vec<u8>, SocketAddr)>();
             let mut slot_workers: Vec<JoinHandle<()>> = Vec::new();
             let base_port = listen.port();
+            let mut bound_slots: Vec<u16> = Vec::new();
             for i in 1..=ingress {
                 let port = match base_port.checked_add(i as u16) {
                     Some(p) => p,
                     None => break,
                 };
                 let Ok(sk) = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))) else { continue };
+                bound_slots.push(port);
                 let _ = sk.set_read_timeout(Some(Duration::from_millis(200)));
                 let sk = Arc::new(sk);
                 let tx = slot_tx.clone();
@@ -325,6 +373,9 @@ impl RelayServer {
                     last_prune = Instant::now();
                     hosts.retain(|_, (_, t)| t.elapsed() < HOST_TTL);
                     open_hosts.retain(|t| hosts.contains_key(t));
+                    if shared.map_or(true, |t| !open_hosts.contains(&t)) {
+                        shared = None;
+                    }
                     clients.retain(|_, c| c.last.elapsed() < CLIENT_TTL);
                     cids.retain(|_, a| clients.contains_key(a));
                     client_gates.retain(|a, _| clients.contains_key(a));
@@ -365,7 +416,7 @@ impl RelayServer {
                 };
                 if n < 5 || &buf[..4] != MAGIC {
                     route_unframed(
-                        &sock, &mut hosts, &mut open_hosts, &mut clients, &mut cids, &mut next_cid,
+                        &sock, &mut hosts, &mut open_hosts, shared, &mut clients, &mut cids, &mut next_cid,
                         n, src, &mut buf, &mut last_unframed_warn,
                     );
                     continue;
@@ -421,27 +472,28 @@ impl RelayServer {
                         }
                         open_hosts.insert(token);
                         if ingress == 0 {
+                            let free = shared.map_or(true, |t| t == token || !open_hosts.contains(&t));
+                            if free {
+                                shared = Some(token);
+                                let _ = sock.send_to(&frame(T_SLOT, &base_port.to_be_bytes()), src);
+                            } else {
+                                let _ = sock.send_to(&frame(T_SLOT, &0u16.to_be_bytes()), src);
+                            }
                             continue;
                         }
                         let assigned = slots.iter().find(|(_, t)| **t == token).map(|(p, _)| *p);
                         let port = match assigned {
                             Some(p) => p,
+                            None if bound_slots.is_empty() => {
+                                shared = Some(token);
+                                base_port
+                            }
                             None => {
-                                if slots.len() >= ingress {
+                                if slots.len() >= bound_slots.len() {
                                     let _ = sock.send_to(&frame(T_SLOT, &0u16.to_be_bytes()), src);
                                     continue;
                                 }
-                                let mut found = 0;
-                                for i in 1..=ingress {
-                                    let p = match base_port.checked_add(i as u16) {
-                                        Some(p) => p,
-                                        None => continue,
-                                    };
-                                    if !slots.contains_key(&p) {
-                                        found = p;
-                                        break;
-                                    }
-                                }
+                                let found = bound_slots.iter().copied().find(|p| !slots.contains_key(p)).unwrap_or(0);
                                 if found == 0 {
                                     let _ = sock.send_to(&frame(T_SLOT, &0u16.to_be_bytes()), src);
                                     continue;
@@ -771,7 +823,7 @@ where
                     slot.store(port as usize, Ordering::Relaxed);
                 }
                 if port == 0 {
-                    log("Relay has no free game port; plain Neptunnel players cannot join.", "warn");
+                    log("Relay has no free game slot; plain Neptunnel players cannot join while another host holds the public port.", "warn");
                 } else {
                     log(&format!("Game port {} assigned by the relay.", port), "ok");
                 }
@@ -914,6 +966,44 @@ mod tests {
 
     fn free_port() -> u16 {
         UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn slot_shares_public_port_when_no_pool_exists() {
+        let base = free_port();
+        let listen: SocketAddr = ([127, 0, 0, 1], base).into();
+        let studio = free_port();
+        let _echo = spawn_echo(studio);
+        let mut relay = RelayServer::start(listen, |_| {}).unwrap();
+
+        let id = Identity::ephemeral();
+        let stop = Arc::new(AtomicBool::new(false));
+        let slot = Arc::new(AtomicUsize::new(0));
+        let (id2, stop2, slot2) = (id.clone(), Arc::clone(&stop), Arc::clone(&slot));
+        let agent = thread::spawn(move || {
+            run_host_agent_slot(listen, id2, studio, stop2, Arc::new(AtomicUsize::new(0)), true, Some(slot2), |_, _| {})
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && slot.load(Ordering::Relaxed) == 0 {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(slot.load(Ordering::Relaxed) as u16, base, "relay should hand out its own port");
+
+        let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+        let mut got = false;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline && !got {
+            c.send_to(b"raw-neptunnel", listen).ok();
+            if let Ok((n, _)) = c.recv_from(&mut [0u8; 256]) {
+                got = n > 0;
+            }
+        }
+        assert!(got, "plain Neptunnel traffic did not reach the studio echo");
+        stop.store(true, Ordering::SeqCst);
+        let _ = agent.join();
+        relay.stop();
     }
 
     #[test]

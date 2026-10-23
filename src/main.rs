@@ -356,6 +356,7 @@ fn launch_gui() {
             .with_title("PuppyTunnel")
             .with_icon(icon.unwrap_or_default())
             .with_decorations(false)
+            .with_transparent(true)
             .with_inner_size([900.0, 680.0])
             .with_min_inner_size([640.0, 520.0]),
         ..Default::default()
@@ -509,6 +510,13 @@ fn run_relay(listen: &str, with_master: Option<&str>, pool: usize, opts: master:
     let stop = stop_flag();
     let mut master = None;
     if let Some(ml) = with_master {
+        let opts = {
+            let mut o = opts;
+            if pool == 0 {
+                o.game_port.get_or_insert(addr.port());
+            }
+            o
+        };
         match master::MasterServer::start(ml, opts) {
             Ok(m) => {
                 println!("[{}] Master server list on http://{} (put Cloudflare in front of this one).", ts(), ml);
@@ -1311,7 +1319,14 @@ fn run_host(config: &config::AppConfig, studio: &str, nep: bool, stop: &Arc<Atom
             for _ in 0..120 {
                 let port = slot.load(Ordering::Relaxed);
                 if port != 0 {
-                    let addr = net::relay::game_address(&config.game_host, &id.token(), port as u16);
+                    let zone = if config.game_host.trim().is_empty() {
+                        master::fetch_game_domain(&master::master_list(&config.master), &net::relay::session_label(&id.token()))
+                            .map(|d| d.zone)
+                            .unwrap_or_else(|| net::relay::DEFAULT_GAME_ZONE.to_string())
+                    } else {
+                        config.game_host.clone()
+                    };
+                    let addr = net::relay::game_address(&zone, &id.token(), port as u16);
                     if addr.is_empty() {
                         println!("[{}] Neptunnel players join with {}:{}", ts(), relay, port);
                     } else {
@@ -1343,8 +1358,10 @@ fn run_host(config: &config::AppConfig, studio: &str, nep: bool, stop: &Arc<Atom
                 console_policy: if config.console_allowed.trim().is_empty() { None } else { Some(config.console_allowed.trim().to_string()) },
                 overhead_tags: if config.overhead_tags { None } else { Some(false) },
                 strict_profiles: if config.strict_profiles { Some(true) } else { None },
+                nep: if config.nep_compat { Some(true) } else { None },
                 host,
                 host_sig,
+                game: None,
                 ts: 0,
             };
             announcer = Some(master::spawn_announcer(
@@ -1353,6 +1370,8 @@ fn run_host(config: &config::AppConfig, studio: &str, nep: bool, stop: &Arc<Atom
                 listing,
                 Arc::clone(&svc),
                 Arc::clone(&ready),
+                None,
+                config.nep_compat.then(|| Arc::clone(&slot)),
                 log_line,
             ));
         }

@@ -19,7 +19,7 @@ use crate::community::types::{
     PermissionFlags, Post, PostInteraction, Report, ReportStatus, SearchResults, UserProfile,
 };
 use crate::identity::{self, hex, token_of, unhex, unix_now, Identity};
-use crate::net::relay::{parse_invite, query_stats};
+use crate::net::relay::{parse_invite, query_stats, valid_game_domain, GameDomain, DEFAULT_GAME_ZONE};
 use crate::privacy::is_public_ip;
 use crate::profile::{self, HostInfo, PublicProfile, SignedProfile};
 use crate::rbxapi::{self, RobloxUser};
@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::ToSocketAddrs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -35,6 +36,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 pub const DEFAULT_MASTER: &str = "https://roblox.puppytunnel.vip";
 pub const FALLBACK_MASTER: &str = "https://updates.puppytunnel.vip";
+pub const GAME_ZONES_FILE: &str = "game_domains.json";
 const PEER_SYNC: Duration = Duration::from_secs(45);
 const MAX_IMPORTED: usize = 2000;
 const TTL: Duration = Duration::from_secs(90);
@@ -73,6 +75,10 @@ pub struct Announce {
     pub overhead_tags: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_profiles: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nep: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<String>,
     #[serde(default)]
     pub ts: u64,
 }
@@ -134,11 +140,15 @@ pub struct Listing {
     pub overhead_tags: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_profiles: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nep: Option<bool>,
     #[serde(default)]
     pub max_players: u32,
     pub invite: String,
     #[serde(default)]
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -149,6 +159,47 @@ pub struct RemoteServer {
     pub host: Option<HostInfo>,
     #[serde(flatten)]
     pub listing: Listing,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GameDomains {
+    #[serde(default = "default_game_zone")]
+    pub default_zone: String,
+    #[serde(default)]
+    pub fixed: HashMap<String, String>,
+}
+
+fn default_game_zone() -> String {
+    DEFAULT_GAME_ZONE.to_string()
+}
+
+impl Default for GameDomains {
+    fn default() -> Self {
+        Self { default_zone: default_game_zone(), fixed: HashMap::new() }
+    }
+}
+
+impl GameDomains {
+    fn load(path: &Path) -> Self {
+        let mut zones: Self = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
+        if !valid_game_domain(&zones.default_zone) {
+            zones.default_zone = default_game_zone();
+        }
+        zones.fixed.retain(|k, v| !k.is_empty() && valid_game_domain(v));
+        zones
+    }
+
+    pub fn zone_for(&self, label: &str) -> GameDomain {
+        let zone = self
+            .fixed
+            .get(label)
+            .filter(|z| valid_game_domain(z))
+            .unwrap_or(&self.default_zone);
+        GameDomain { zone: zone.trim().trim_matches('.').to_string(), host: String::new() }
+    }
 }
 
 pub fn strict_profile_ok(display_name: &str) -> bool {
@@ -188,6 +239,8 @@ fn to_listing(a: &Announce) -> Result<Listing, &'static str> {
         max_players: a.max_players.min(1000),
         invite: a.invite.clone(),
         version: clean(&a.version, 16),
+        game: a.game.as_ref().map(|g| clean(g, 120)).filter(|g| !g.is_empty()),
+        nep: a.nep,
         console_policy: a.console_policy.clone(),
         overhead_tags: a.overhead_tags,
         strict_profiles: a.strict_profiles,
@@ -672,6 +725,7 @@ pub struct MasterOptions {
     pub persist_profiles_cache: bool,
     pub data_dir: Option<std::path::PathBuf>,
     pub strict_profiles: bool,
+    pub game_port: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -683,6 +737,8 @@ struct Ctx {
     persist_profiles: bool,
     data_dir: std::path::PathBuf,
     strict_profiles: bool,
+    zones: GameDomains,
+    game_port: Option<u16>,
 }
 
 pub struct MasterServer {
@@ -726,6 +782,8 @@ impl MasterServer {
             roblox: opts.roblox_api.clone().unwrap_or_else(|| rbxapi::USERS_API.to_string()),
             persist_profiles: opts.persist_profiles_cache,
             strict_profiles: opts.strict_profiles,
+            zones: GameDomains::load(&data_dir.join(GAME_ZONES_FILE)),
+            game_port: opts.game_port.filter(|p| *p != 0),
             data_dir,
         };
         for signed in stored_profiles {
@@ -1068,12 +1126,35 @@ fn handle(mut req: Request, ctx: &Ctx, trust_proxy: bool) {
                     id: id_of(k),
                     age_secs: e.first.elapsed().as_secs(),
                     host: host_info(&st.profiles, &e.host_key),
-                    listing: e.listing.clone(),
+                    listing: {
+                        let mut l = e.listing.clone();
+                        if l.game.is_none() && l.nep == Some(true) {
+                            l.game = ctx.game_port.and_then(|port| {
+                                parse_invite(&l.invite).and_then(|(_, _, token)| {
+                                    let addr = ctx.zones.zone_for(&crate::net::relay::session_label(&token)).address(&token, port);
+                                    (!addr.is_empty()).then_some(addr)
+                                })
+                            });
+                        }
+                        l
+                    },
                 })
                 .collect();
             sort_servers(&mut list, params.get("sort").map(|s| s.as_str()).unwrap_or("players"));
             drop(st);
             json(req, 200, serde_json::to_value(list).unwrap_or_default(), true);
+        }
+        (Method::Get, "/api/zone") => {
+            let label: String = params
+                .get("label")
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .take(16)
+                .collect();
+            let domain = ctx.zones.zone_for(&label);
+            json(req, 200, serde_json::to_value(domain).unwrap_or_default(), true);
         }
         (Method::Get, "/api/profile") => {
             let id = params.get("id").cloned().unwrap_or_default();
@@ -2569,6 +2650,26 @@ pub fn master_list(raw: &str) -> Vec<String> {
     out
 }
 
+pub fn fetch_game_domain(masters: &[String], label: &str) -> Option<GameDomain> {
+    for master in masters {
+        let zone = match agent()
+            .get(&format!("{}/api/zone", normalize_url(master)))
+            .query("label", label)
+            .call()
+        {
+            Ok(r) => match r.into_json::<GameDomain>() {
+                Ok(z) => z,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        if !zone.is_empty() {
+            return Some(zone);
+        }
+    }
+    None
+}
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(Duration::from_secs(8)).build()
 }
@@ -2645,6 +2746,8 @@ pub fn spawn_announcer<L>(
     base: Announce,
     stop: Arc<AtomicBool>,
     ready: Arc<AtomicBool>,
+    game_zone: Option<String>,
+    game_slot: Option<Arc<AtomicUsize>>,
     log: L,
 ) -> JoinHandle<()>
 where
@@ -2656,7 +2759,8 @@ where
             .into_iter()
             .map(|m| {
                 let (id, b, st, rd, lg) = (identity.clone(), base.clone(), Arc::clone(&stop), Arc::clone(&ready), Arc::clone(&log));
-                thread::spawn(move || announce_loop(m, id, b, st, rd, move |msg, tag| lg(msg, tag)))
+                let (zone, slot) = (game_zone.clone(), game_slot.clone());
+                thread::spawn(move || announce_loop(m, id, b, st, rd, zone, slot, move |msg, tag| lg(msg, tag)))
             })
             .collect();
         for h in inner {
@@ -2665,7 +2769,22 @@ where
     })
 }
 
-fn announce_loop<L: Fn(&str, &str)>(master: String, id: Identity, base: Announce, stop: Arc<AtomicBool>, ready: Arc<AtomicBool>, log: L) {
+fn announce_loop<L: Fn(&str, &str)>(
+    master: String,
+    id: Identity,
+    mut base: Announce,
+    stop: Arc<AtomicBool>,
+    ready: Arc<AtomicBool>,
+    game_zone: Option<String>,
+    game_slot: Option<Arc<AtomicUsize>>,
+    log: L,
+) {
+    let label = parse_invite(&base.invite)
+        .map(|(_, _, token)| crate::net::relay::session_label(&token))
+        .unwrap_or_default();
+    let zone = game_zone
+        .or_else(|| fetch_game_domain(&[master.clone()], &label).map(|d| d.zone))
+        .unwrap_or_else(|| DEFAULT_GAME_ZONE.to_string());
     let mut ok_before = false;
     let mut failed_reported = false;
     let mut waited = false;
@@ -2678,6 +2797,15 @@ fn announce_loop<L: Fn(&str, &str)>(master: String, id: Identity, base: Announce
             }
             thread::sleep(Duration::from_millis(500));
             continue;
+        }
+        if let (Some(slot), Some(true)) = (&game_slot, base.nep) {
+            let port = slot.load(Ordering::Relaxed) as u16;
+            base.game = parse_invite(&base.invite).and_then(|(_, _, token)| {
+                let addr = crate::net::relay::game_address(&zone, &token, port);
+                (!addr.is_empty() && port != 0).then_some(addr)
+            });
+        } else {
+            base.game = None;
         }
         if last.map_or(true, |t| t.elapsed() >= ANNOUNCE_EVERY) {
             last = Some(Instant::now());
@@ -2822,7 +2950,7 @@ mod tests {
     fn strict_profile_names_gated() {
         let id = Identity::profile("test-secret");
         let mk = |display_name: &str| SignedProfile::sign(&id, profile::ProfileBody { roblox_id: 7, display_name: display_name.into(), bio: "hi".into(), accent: "mint".into(), ts: 0 });
-        let ctx = |strict: bool| Ctx { roblox: String::new(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::path::PathBuf::new(), strict_profiles: strict };
+        let ctx = |strict: bool| Ctx { roblox: String::new(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::path::PathBuf::new(), strict_profiles: strict, zones: GameDomains::default(), game_port: None };
         assert!(ingest_profile(&ctx(false), mk("   "), "127.0.0.1").is_ok());
         assert_eq!(ingest_profile(&ctx(true), mk("   "), "127.0.0.1"), Err((400, "display name is required")));
         assert!(ingest_profile(&ctx(true), mk("Somebody"), "127.0.0.1").is_ok());
@@ -2934,7 +3062,7 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(errs.len(), 1);
 
-        let ctx = Ctx { roblox: rbxapi::USERS_API.to_string(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::env::temp_dir(), strict_profiles: false };
+        let ctx = Ctx { roblox: rbxapi::USERS_API.to_string(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::env::temp_dir(), strict_profiles: false, zones: GameDomains::default(), game_port: None };
         let mut forged = SignedAnnounce::sign(&host.id, body("Legit", &host.invite));
         forged.body.description = "send me your password".into();
         assert!(ingest(&ctx, forged, "", true).is_err());

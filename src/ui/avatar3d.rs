@@ -118,7 +118,7 @@ impl Avatar3d {
         ui.ctx().request_repaint();
 
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, Rounding::same(20.0), FIELD);
+        painter.rect_filled(rect, Rounding::same(20.0), SURF_1);
 
         let dist = 18.0_f32;
         let px_per_stud = size.y * 0.80 / 5.8;

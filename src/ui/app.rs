@@ -24,7 +24,7 @@ use crate::rbxapi::{self, RobloxUser};
 use crate::ui::picker::{native_pick, PickResult, PickTarget, Picker};
 use crate::ui::widgets::*;
 use eframe::egui::{
-    self, Align, Color32, Layout, Margin, RichText, Rounding, ScrollArea, Sense, Stroke, Vec2,
+    self, pos2, Align, Color32, FontId, LayerId, Layout, Margin, Rect, RichText, Rounding, ScrollArea, Sense, Vec2,
 };
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
@@ -41,7 +41,6 @@ pub const MAX_LOG_ENTRIES: usize = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Screen {
-    Home,
     Host,
     HostRunning,
     Join,
@@ -51,12 +50,10 @@ enum Screen {
     Profile,
     Tools,
     About,
-    Updates,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Section {
-    Home,
     Play,
     Community,
     Profile,
@@ -65,12 +62,11 @@ enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 6] = [Section::Home, Section::Play, Section::Community, Section::Profile, Section::Tools, Section::About];
+    const ALL: [Section; 5] = [Section::Play, Section::Community, Section::Profile, Section::Tools, Section::About];
 
     fn label(self) -> &'static str {
         match self {
-            Section::Home => "home",
-            Section::Play => "play",
+            Section::Play => "session",
             Section::Community => "community",
             Section::Profile => "profile",
             Section::Tools => "tools",
@@ -80,7 +76,6 @@ impl Section {
 
     fn icon(self) -> Icon {
         match self {
-            Section::Home => Icon::Home,
             Section::Play => Icon::Play,
             Section::Community => Icon::Community,
             Section::Profile => Icon::Profile,
@@ -92,12 +87,11 @@ impl Section {
 
 fn section_of(screen: Screen) -> Section {
     match screen {
-        Screen::Home => Section::Home,
         Screen::Host | Screen::HostRunning | Screen::Join | Screen::JoinRunning | Screen::Browse => Section::Play,
         Screen::Community => Section::Community,
         Screen::Profile => Section::Profile,
         Screen::Tools => Section::Tools,
-        Screen::About | Screen::Updates => Section::About,
+        Screen::About => Section::About,
     }
 }
 
@@ -135,7 +129,7 @@ struct ProfileState {
 
 #[derive(Default)]
 struct BrowserState {
-    servers: Vec<RemoteServer>,
+    servers: Arc<Vec<RemoteServer>>,
     loading: bool,
     error: String,
 }
@@ -186,6 +180,7 @@ pub struct NepApp {
     game_port: Arc<AtomicUsize>,
     game_port_poll: Option<Instant>,
     game_token: crate::net::relay::Token,
+    game_zone: Arc<Mutex<Option<String>>>,
     players: Arc<AtomicUsize>,
     announcer: Option<thread::JoinHandle<()>>,
     announce_ready: Arc<AtomicBool>,
@@ -216,6 +211,7 @@ pub struct NepApp {
     throne_icon: Option<egui::TextureHandle>,
     update_manager: crate::update::UpdateManager,
     community_state: crate::ui::community::CommunityUiState,
+    shot_at: Option<Instant>,
 }
 
 impl NepApp {
@@ -258,8 +254,9 @@ impl NepApp {
         #[cfg(debug_assertions)]
         let (start_screen, start_profile_tab, start_tool_tab) = preview_target();
         #[cfg(not(debug_assertions))]
-        let (start_screen, start_profile_tab, start_tool_tab) = (Screen::Home, ProfileTab::Account, ToolTab::Echo);
+        let (start_screen, start_profile_tab, start_tool_tab) = (Screen::Host, ProfileTab::Account, ToolTab::Echo);
 
+        let logs = Arc::new(Mutex::new(Vec::new()));
         Self {
             config,
             screen: start_screen,
@@ -274,7 +271,7 @@ impl NepApp {
             join_client: None,
             join_client_dead: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
 
-            logs: Arc::new(Mutex::new(Vec::new())),
+            logs,
             stop_flag: Arc::new(AtomicBool::new(false)),
 
             server_process: None,
@@ -290,6 +287,7 @@ impl NepApp {
             game_port: Arc::new(AtomicUsize::new(0)),
             game_port_poll: None,
             game_token: [0u8; 16],
+            game_zone: Arc::new(Mutex::new(None)),
             players: Arc::new(AtomicUsize::new(0)),
             announcer: None,
             announce_ready: Arc::new(AtomicBool::new(cfg!(not(target_os = "linux")))),
@@ -320,6 +318,7 @@ impl NepApp {
             throne_icon: None,
             update_manager,
             community_state: crate::ui::community::CommunityUiState::default(),
+            shot_at: None,
         }
     }
 
@@ -401,6 +400,50 @@ impl NepApp {
     fn joined(&self) -> bool {
         self.proxy_handle.is_some()
     }
+
+    fn needs_frame(&self) -> Option<Duration> {
+        let mut next: Option<Duration> = None;
+        let mut want = |d: Duration| {
+            next = Some(match next {
+                Some(n) if n < d => n,
+                _ => d,
+            });
+        };
+        if let Some(start) = self.server_start_time {
+            if !self.server_live && self.hosting() {
+                want(Duration::from_secs(5).saturating_sub(start.elapsed()));
+            }
+        }
+        if let Some(t) = self.game_port_poll {
+            let zone_pending = self.game_zone.lock().map(|z| z.is_none()).unwrap_or(false);
+            if self.game_port.load(Ordering::Relaxed) != 0 && zone_pending && t.elapsed() < Duration::from_secs(12) {
+                want(Duration::from_millis(150));
+            } else {
+                want(Duration::from_secs(12).saturating_sub(t.elapsed()));
+            }
+        }
+        if self.join_echo_running.load(Ordering::SeqCst) {
+            want(Duration::from_millis(500));
+        }
+        if let Some((_, at)) = &self.copied_target {
+            if at.elapsed() < Duration::from_secs(2) {
+                want(Duration::from_secs(2).saturating_sub(at.elapsed()));
+            }
+        }
+        if self.update_manager.is_busy() {
+            want(Duration::from_millis(250));
+        }
+        if self.browser.lock().map_or(false, |s| s.loading) {
+            want(Duration::from_millis(500));
+        }
+        if self.profile_state.lock().map_or(false, |s| s.loading || s.publishing) {
+            want(Duration::from_millis(500));
+        }
+        if self.screen == Screen::Community {
+            want(Duration::from_secs(3).saturating_sub(self.community_state.last_sync.elapsed()));
+        }
+        next.map(|d| d.max(Duration::from_millis(16)))
+    }
 }
 
 impl Drop for NepApp {
@@ -411,13 +454,20 @@ impl Drop for NepApp {
 }
 
 impl eframe::App for NepApp {
-    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
-        visuals.panel_fill.to_normalized_gamma_f32()
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(Duration::from_millis(100));
+        let trace_start = Instant::now();
+        if let Some(every) = self.needs_frame() {
+            ctx.request_repaint_after(every);
+        }
         handle_resize(ctx);
+        let screen = ctx.screen_rect();
+        let radius = if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) { 0.0 } else { R_WINDOW };
+        ctx.layer_painter(LayerId::background())
+            .rect_filled(screen.shrink(0.5), Rounding::same(radius), INK);
 
         if !self.profile_loaded {
             self.profile_loaded = true;
@@ -450,63 +500,66 @@ impl eframe::App for NepApp {
         self.poll_game_port();
 
         self.community_state.local_headshot = self.headshot.clone();
-        self.community_state.local_avatar = self.avatar_tex.clone();
 
-        if let Some(query) = self.community_state.request_fetch_roblox.take() {
-            self.roblox_query = query.clone();
-            self.fetch_roblox(query);
-        }
-
-        if let Ok(st) = self.profile_state.lock() {
-            self.community_state.is_roblox_loading = st.loading;
-            self.community_state.roblox_error = st.error.clone();
-        }
-
-        let compact = ctx.screen_rect().width() < 900.0;
+        let w = ctx.screen_rect().width();
+        let narrow = w < 720.0;
+        let rail = if narrow { 48.0 } else { 60.0 };
         egui::TopBottomPanel::top("titlebar")
-            .exact_height(58.0)
-            .frame(egui::Frame::none().fill(BG_SOFT).inner_margin(Margin::symmetric(16.0, 0.0)))
-            .show(ctx, |ui| self.render_titlebar(ui, ctx, compact));
+            .exact_height(40.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(Margin { left: 18.0, right: 10.0, top: 0.0, bottom: 0.0 }),
+            )
+            .show(ctx, |ui| self.render_titlebar(ui, ctx));
 
-        let section = section_of(self.screen);
-        if section != Section::Home {
-            egui::TopBottomPanel::top("subnav")
-                .exact_height(46.0)
-                .frame(egui::Frame::none().fill(BG_SOFT).inner_margin(Margin::symmetric(16.0, 0.0)))
-                .show(ctx, |ui| self.render_subnav(ui, section, compact));
-        }
+        egui::SidePanel::left("rail")
+            .exact_width(rail)
+            .resizable(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(Margin {
+                        left: 4.0,
+                        right: 4.0,
+                        top: 8.0,
+                        bottom: 16.0,
+                    }),
+            )
+            .show(ctx, |ui| self.render_rail(ui, narrow));
 
         egui::TopBottomPanel::bottom("status")
-            .exact_height(30.0)
-            .frame(egui::Frame::none().fill(BG_SOFT).inner_margin(Margin::symmetric(20.0, 0.0)))
+            .exact_height(22.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(Margin { left: rail + 16.0, right: 18.0, top: 0.0, bottom: 0.0 }),
+            )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new(&self.status_text).size(12.0).color(DIM));
+                    let (color, text) = self.status_line();
+                    ui.label(RichText::new(text).size(T_META).color(color));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(format!("v{}", crate::update::CURRENT_VERSION)).size(12.0).color(DIM));
+                        ui.label(
+                            RichText::new(format!("v{}", crate::update::CURRENT_VERSION))
+                                .size(T_META)
+                                .color(tint(TX_FAINT, 0.7)),
+                        );
                     });
                 });
             });
 
-        let content_w = (ctx.screen_rect().width() - 48.0).min(CONTENT);
-        let side = ((ctx.screen_rect().width() - content_w) / 2.0).max(20.0);
+        let content_w = (ctx.screen_rect().width() - rail - 48.0).clamp(320.0, CONTENT);
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BG).inner_margin(Margin { left: side, right: side, top: 10.0, bottom: 8.0 }))
+            .frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(Margin {
+                left: 8.0,
+                right: ((w - rail - content_w) / 2.0).max(16.0),
+                top: 4.0,
+                bottom: 10.0,
+            }))
             .show(ctx, |ui| {
                 ui.set_max_width(content_w);
-                match self.screen {
-                    Screen::Home => self.render_home(ui),
-                    Screen::Host => self.render_host(ui),
-                    Screen::HostRunning => self.render_host_running(ui),
-                    Screen::Join => self.render_join(ui),
-                    Screen::JoinRunning => self.render_join_running(ui),
-                    Screen::Browse => self.render_browse(ui),
-                    Screen::Community => self.community_state.render(ui, &mut self.config, ctx),
-                    Screen::Profile => self.render_profile_section(ui, ctx),
-                    Screen::Tools => self.render_tools(ui),
-                    Screen::About => self.render_about(ui),
-                    Screen::Updates => self.render_updates(ui),
-                }
+                self.render_page(ui, ctx, narrow);
             });
 
         if let Some(picker) = &mut self.picker {
@@ -521,6 +574,69 @@ impl eframe::App for NepApp {
                     self.picker = None;
                     self.apply_pick(target, files);
                 }
+            }
+        }
+        if let Ok(path) = std::env::var("PT_TRACE") {
+            let ms = trace_start.elapsed().as_secs_f64() * 1000.0;
+            if ms > 16.0 {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, "{:?} frame {:.1} ms", self.screen, ms);
+                }
+            }
+        }
+        if let Ok(spec) = std::env::var("PT_AUTO") {
+            if self.shot_at.is_none() {
+                self.shot_at = Some(Instant::now());
+            }
+            if self.shot_at.map_or(false, |t| t.elapsed() > Duration::from_secs(2)) {
+                self.shot_at = Some(Instant::now() + Duration::from_secs(600));
+                match spec.as_str() {
+                    "community" => self.go_section(Section::Community),
+                    "profile" => self.go_section(Section::Profile),
+                    _ => {}
+                }
+                ctx.request_repaint();
+            }
+        }
+        if std::env::var("PT_SHOT").is_ok() {
+            if self.shot_at.is_none() {
+                self.shot_at = Some(Instant::now());
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+                ctx.request_repaint();
+            }
+            if let Some(img) = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            }) {
+                if let Ok(path) = std::env::var("PT_SHOT") {
+                    let (w, h) = (img.size[0], img.size[1]);
+                    let mut rgba = Vec::with_capacity(w * h * 4);
+                    for px in img.pixels.iter() {
+                        rgba.extend_from_slice(&[px.r(), px.g(), px.b(), px.a()]);
+                    }
+                    let marker = format!("{}.log", path);
+                    let mut png = Vec::new();
+                    let note = match image::RgbaImage::from_raw(w as u32, h as u32, rgba) {
+                        Some(buf) => {
+                            use image::ImageEncoder;
+                            match image::codecs::png::PngEncoder::new(&mut png)
+                                .write_image(buf.as_raw(), w as u32, h as u32, image::ExtendedColorType::Rgba8)
+                            {
+                                Ok(()) => match std::fs::write(&path, &png) {
+                                    Ok(()) => format!("saved {}x{} {} bytes", w, h, png.len()),
+                                    Err(e) => format!("write error: {}", e),
+                                },
+                                Err(e) => format!("encode error: {}", e),
+                            }
+                        }
+                        None => format!("bad buffer {}x{}", w, h),
+                    };
+                    let _ = std::fs::write(marker, note);
+                }
+                self.shot_at = None;
             }
         }
     }
@@ -541,8 +657,8 @@ fn preview_target() -> (Screen, ProfileTab, ToolTab) {
         "tools" => (Screen::Tools, ProfileTab::Account, ToolTab::Echo),
         "models" => (Screen::Tools, ProfileTab::Account, ToolTab::Models),
         "about" => (Screen::About, ProfileTab::Account, ToolTab::Echo),
-        "updates" => (Screen::Updates, ProfileTab::Account, ToolTab::Echo),
-        _ => (Screen::Home, ProfileTab::Account, ToolTab::Echo),
+        "updates" => (Screen::About, ProfileTab::Account, ToolTab::Echo),
+        _ => (Screen::Host, ProfileTab::Account, ToolTab::Echo),
     }
 }
 
@@ -552,26 +668,6 @@ fn load_rgba_texture(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<eg
     let size = [rgba.width() as usize, rgba.height() as usize];
     let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
     Some(ctx.load_texture(name, color, egui::TextureOptions::LINEAR))
-}
-
-fn home_card(ui: &mut egui::Ui, w: f32, icon: Icon, title: &str, sub: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 116.0), Sense::click());
-    let hover = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.16);
-    let p = ui.painter();
-    let fill = CARD.lerp_to_gamma(CARD_HI, hover);
-    p.rect_filled(rect, Rounding::same(RADIUS), fill);
-    p.rect_stroke(rect, Rounding::same(RADIUS), Stroke::new(1.0_f32, LINE.lerp_to_gamma(MINT_DIM, hover)));
-    let badge = egui::pos2(rect.left() + 33.0, rect.top() + 34.0);
-    p.circle_filled(badge, 17.0, FIELD.lerp_to_gamma(MINT_DIM, hover * 0.35));
-    crate::ui::icons::paint(p, badge, 19.0, icon, MINT);
-    p.text(egui::pos2(rect.left() + 18.0, rect.top() + 72.0), egui::Align2::LEFT_CENTER, lc(title), egui::FontId::proportional(14.5), INK);
-    let galley = p.layout(lc(sub), egui::FontId::proportional(11.5), DIM, rect.width() - 36.0);
-    p.galley(egui::pos2(rect.left() + 18.0, rect.top() + 86.0), galley, DIM);
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    if resp.clicked() {
-        crate::ui::sound::play_click();
-    }
-    resp.clicked()
 }
 
 fn handle_resize(ctx: &egui::Context) {
@@ -601,26 +697,26 @@ fn handle_resize(ctx: &egui::Context) {
 }
 
 fn window_button(ui: &mut egui::Ui, kind: u8) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if resp.hovered() {
-        let fill = if kind == 2 { ERR } else { FIELD_HI };
-        ui.painter().circle_filled(rect.center(), 16.0, fill);
+        let fill = if kind == 2 { tint(RED, 0.7) } else { SURF_2 };
+        ui.painter().rect_filled(rect.shrink(2.0), Rounding::same(R_SM), fill);
     }
     let c = rect.center();
-    let col = if resp.hovered() && kind == 2 { egui::Color32::WHITE } else { INK };
-    let st = egui::Stroke::new(1.5_f32, col);
+    let col = if resp.hovered() && kind == 2 { egui::Color32::WHITE } else { TX };
+    let st = egui::Stroke::new(1.25_f32, col);
     let p = ui.painter();
     match kind {
         0 => {
-            p.line_segment([c + egui::vec2(-5.0, 3.0), c + egui::vec2(5.0, 3.0)], st);
+            p.line_segment([c + egui::vec2(-4.5, 3.0), c + egui::vec2(4.5, 3.0)], st);
         }
         1 => {
-            p.rect_stroke(egui::Rect::from_center_size(c, egui::vec2(10.0, 10.0)), 2.0, st);
+            p.rect_stroke(egui::Rect::from_center_size(c, egui::vec2(9.0, 9.0)), 1.5, st);
         }
         _ => {
-            p.line_segment([c + egui::vec2(-4.5, -4.5), c + egui::vec2(4.5, 4.5)], st);
-            p.line_segment([c + egui::vec2(-4.5, 4.5), c + egui::vec2(4.5, -4.5)], st);
+            p.line_segment([c + egui::vec2(-4.0, -4.0), c + egui::vec2(4.0, 4.0)], st);
+            p.line_segment([c + egui::vec2(-4.0, 4.0), c + egui::vec2(4.0, -4.0)], st);
         }
     }
     let clicked = resp.clicked();
@@ -632,9 +728,7 @@ fn window_button(ui: &mut egui::Ui, kind: u8) -> bool {
 
 impl NepApp {
     fn go_section(&mut self, sec: Section) {
-        save_config(&self.config);
         let target = match sec {
-            Section::Home => Screen::Home,
             Section::Play => {
                 if section_of(self.screen) == Section::Play {
                     return;
@@ -663,7 +757,7 @@ impl NepApp {
         self.screen = target;
     }
 
-    fn render_titlebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, compact: bool) {
+    fn render_titlebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let bar = ui.max_rect();
         let drag = ui.interact(bar, egui::Id::new("titlebar_drag"), Sense::click_and_drag());
         if drag.drag_started() {
@@ -675,33 +769,15 @@ impl NepApp {
         }
 
         ui.horizontal_centered(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().item_spacing.x = 9.0;
             if let Some(logo) = &self.logo {
-                ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(40.0)));
+                ui.add(egui::Image::new(logo).fit_to_exact_size(Vec2::splat(17.0)));
             }
-            ui.add_space(if compact { 10.0 } else { 22.0 });
+            ui.label(RichText::new("puppytunnel").size(T_META).color(TX_DIM));
 
-            let current = section_of(self.screen);
-            let unread = self.community_state.unread_count();
-            for sec in Section::ALL {
-                let mut label = if compact { String::new() } else { sec.label().to_string() };
-                let badge = match sec {
-                    Section::Community => unread > 0,
-                    Section::About => matches!(
-                        self.update_manager.state(),
-                        crate::update::UpdateState::Available(_) | crate::update::UpdateState::ReadyToInstall(..)
-                    ),
-                    Section::Play => self.hosting() || self.joined(),
-                    _ => false,
-                };
-                if badge && !compact {
-                    label.push_str(" •");
-                }
-                let resp = pill_icon(ui, Some(sec.icon()), &label, current == sec, false);
-                let resp = if compact { resp.on_hover_text(sec.label()) } else { resp };
-                if resp.clicked() {
-                    self.go_section(sec);
-                }
+            if let Some((label, color)) = self.page_status() {
+                ui.add_space(12.0);
+                ui.label(RichText::new(label).size(T_META).color(color));
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -719,214 +795,187 @@ impl NepApp {
         });
     }
 
-    fn render_subnav(&mut self, ui: &mut egui::Ui, section: Section, compact: bool) {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let shown = |label: &str| if compact { String::new() } else { label.to_string() };
-            match section {
-                Section::Play => {
-                    let items = [
-                        ("host", Icon::Host, matches!(self.screen, Screen::Host | Screen::HostRunning), if self.hosting() { Screen::HostRunning } else { Screen::Host }),
-                        ("join", Icon::Join, matches!(self.screen, Screen::Join | Screen::JoinRunning), if self.joined() { Screen::JoinRunning } else { Screen::Join }),
-                        ("servers", Icon::Servers, self.screen == Screen::Browse, Screen::Browse),
-                    ];
-                    for (label, icon, active, target) in items {
-                        if pill_icon(ui, Some(icon), &shown(label), active, true).on_hover_text(label).clicked() && !active {
-                            save_config(&self.config);
-                            if target == Screen::Browse {
-                                self.browser_dirty = true;
-                            }
-                            self.screen = target;
-                        }
-                    }
+    fn render_rail(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let current = section_of(self.screen);
+        let unread = self.community_state.unread_count();
+        let has_update = self.update_manager.has_release();
+        let running = self.hosting() || self.joined();
+        let _ = compact;
+        ui.add_space(4.0);
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            for sec in Section::ALL {
+                let badge = match sec {
+                    Section::Community => unread > 0,
+                    Section::Play => running,
+                    Section::About => has_update,
+                    _ => false,
+                };
+                let resp = rail_item(ui, sec.icon(), current == sec, badge);
+                if resp.on_hover_text(sec.label()).clicked() {
+                    self.go_section(sec);
                 }
-                Section::Community => {
-                    use crate::ui::community::CommunityTab as T;
-                    let unread = self.community_state.unread_count();
-                    let pending = self.community_state.pending_reports();
-                    let is_owner = self.config.roblox_id == 2721761670;
-                    let mut items = vec![
-                        ("feed", Icon::Feed, T::Feed, 0),
-                        ("messages", Icon::Messages, T::Messages, 0),
-
-                        ("notifications", Icon::Bell, T::Notifications, unread),
-                        ("search", Icon::Search, T::Search, 0),
-                    ];
-                    if is_owner {
-                        items.push(("moderation", Icon::Gavel, T::Moderation, pending));
-                    }
-                    for (label, icon, tab, count) in items {
-                        let active = self.community_state.active_tab == tab;
-                        let text = if count > 0 && !compact { format!("{} {}", label, count) } else { shown(label) };
-                        if pill_icon(ui, Some(icon), &text, active, true).on_hover_text(label).clicked() && !active {
-                            self.community_state.select_tab(tab);
-                        }
-                    }
-                }
-                Section::Profile => {
-                    let items = [
-                        ("account", Icon::Profile, ProfileTab::Account),
-                        ("public profile", Icon::Community, ProfileTab::Public),
-                        ("keys", Icon::Key, ProfileTab::Keys),
-                    ];
-                    for (label, icon, tab) in items {
-                        let active = self.profile_tab == tab;
-                        if pill_icon(ui, Some(icon), &shown(label), active, true).on_hover_text(label).clicked() {
-                            self.profile_tab = tab;
-                        }
-                    }
-                }
-                Section::Tools => {
-                    let items = [("echo test", Icon::Echo, ToolTab::Echo), ("models", Icon::Cube, ToolTab::Models)];
-                    for (label, icon, tab) in items {
-                        let active = self.tool_tab == tab;
-                        if pill_icon(ui, Some(icon), &shown(label), active, true).on_hover_text(label).clicked() {
-                            self.tool_tab = tab;
-                        }
-                    }
-                }
-                Section::About => {
-                    let has_update = matches!(
-                        self.update_manager.state(),
-                        crate::update::UpdateState::Available(_) | crate::update::UpdateState::ReadyToInstall(..)
-                    );
-                    let items = [
-                        ("about", Icon::About, Screen::About, false),
-                        ("updates", Icon::Update, Screen::Updates, has_update),
-                    ];
-                    for (label, icon, target, dot) in items {
-                        let active = self.screen == target;
-                        let text = if dot && !compact { format!("{} •", label) } else { shown(label) };
-                        if pill_icon(ui, Some(icon), &text, active, true).on_hover_text(label).clicked() {
-                            self.screen = target;
-                        }
-                    }
-                }
-                Section::Home => {}
             }
         });
     }
 
-
-    fn render_home(&mut self, ui: &mut egui::Ui) {
-        ScrollArea::vertical().id_salt("home_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            let name = if self.config.display_name.trim().is_empty() && self.config.roblox_name.trim().is_empty() {
-                String::new()
+    fn page_status(&self) -> Option<(String, Color32)> {
+        match self.screen {
+            Screen::HostRunning => Some(if self.server_live {
+                (format!("live · {} connected", self.players.load(Ordering::Relaxed)), BRUISE_LIT)
             } else {
-                self.config.effective_display_name().to_string()
-            };
-            let hello = if name.is_empty() { "hey there".to_string() } else { format!("hey, {}", name) };
-            ui.add_space(6.0);
-            ui.label(RichText::new(lc(&hello)).size(28.0).color(INK));
-            ui.label(muted("what do you want to do?"));
-            ui.add_space(16.0);
-
-            let gap = 12.0;
-            let w = (ui.available_width() - gap * 2.0) / 3.0;
-            let cards = [
-                (Icon::Host, "host a server", "start a studio server and invite people", Screen::Host),
-                (Icon::Join, "join a server", "paste an invite or an address", Screen::Join),
-                (Icon::Servers, "browse servers", "public servers from your masters", Screen::Browse),
-            ];
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = gap;
-                for (icon, title, sub, target) in cards {
-                    if home_card(ui, w, icon, title, sub) {
-                        if target == Screen::Browse {
-                            self.browser_dirty = true;
-                        }
-                        self.screen = if target == Screen::Host && self.hosting() {
-                            Screen::HostRunning
-                        } else if target == Screen::Join && self.joined() {
-                            Screen::JoinRunning
-                        } else {
-                            target
-                        };
-                    }
-                }
-            });
-            ui.add_space(14.0);
-
-            card(ui, Some("session"), |ui| {
-                if self.hosting() {
-                    ui.horizontal(|ui| {
-                        chip(ui, if self.server_live { "hosting · live" } else { "hosting · starting" }, MINT);
-                        ui.label(muted(format!("{} connected", self.players.load(Ordering::Relaxed))));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if secondary_icon(ui, Icon::Host, "open") {
-                                self.screen = Screen::HostRunning;
-                            }
-                            if let Some(inv) = self.invite.clone() {
-                                if secondary_icon(ui, Icon::Copy, "copy invite") {
-                                    copy_text(&inv);
-                                }
-                            }
-                        });
-                    });
-                } else if self.joined() {
-                    ui.horizontal(|ui| {
-                        chip(ui, "connected", MINT);
-                        ui.label(muted(&self.config.addr));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if secondary_icon(ui, Icon::Join, "open") {
-                                self.screen = Screen::JoinRunning;
-                            }
-                        });
-                    });
+                ("starting".to_string(), TX_DIM)
+            }),
+            Screen::JoinRunning => {
+                let running = self.proxy_handle.as_ref().map_or(false, |p| p.is_running());
+                Some(if running {
+                    ("connected".to_string(), BRUISE_LIT)
                 } else {
-                    ui.label(muted("nothing running. host a server or join one above."));
+                    ("stopped".to_string(), RED_LIT)
+                })
+            }
+            Screen::Browse => {
+                let st = self.browser.lock().ok()?;
+                if st.loading {
+                    Some(("refreshing".to_string(), TX_DIM))
+                } else if st.error.is_empty() {
+                    Some((format!("{} online", st.servers.len()), BRUISE_LIT))
+                } else {
+                    None
                 }
-            });
-            ui.add_space(12.0);
-
-            card(ui, Some("you"), |ui| {
-                ui.horizontal(|ui| {
-                    if let Some(tex) = &self.headshot {
-                        ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::splat(44.0)).rounding(22.0));
-                    }
-                    ui.vertical(|ui| {
-                        if self.config.roblox_id != 0 {
-                            ui.label(RichText::new(lc(self.config.effective_display_name())).size(16.0).color(INK));
-                            let verified = self.profile_state.lock().map(|s| s.verified).unwrap_or(None);
-                            match verified {
-                                Some(true) => chip(ui, "verified", MINT),
-                                _ => chip(ui, "unverified", WARN),
-                            }
-                        } else {
-                            ui.label(muted("no roblox account linked"));
-                        }
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if secondary_icon(ui, Icon::Profile, "open profile") {
-                            self.screen = Screen::Profile;
-                        }
-                    });
-                });
-            });
-            ui.add_space(12.0);
-            card(ui, Some("community"), |ui| {
-                ui.horizontal(|ui| {
-                    let unread = self.community_state.unread_count();
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new(if unread > 0 { format!("{} unread", unread) } else { "all caught up".to_string() }).size(16.0).color(INK));
-                        ui.label(muted(format!("on {}", self.community_state.instance_label(&self.config))));
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if secondary_icon(ui, Icon::Community, "open community") {
-                            self.community_state.open();
-                            self.screen = Screen::Community;
-                        }
-                    });
-                });
-            });
-            ui.add_space(12.0);
-        });
+            }
+            _ => None,
+        }
     }
 
+    fn status_line(&self) -> (Color32, String) {
+        if let Some((label, color)) = self.page_status() {
+            return (color, label);
+        }
+        if self.hosting() {
+            return (BRUISE_LIT, format!("hosting · {} connected", self.players.load(Ordering::Relaxed)));
+        }
+        if self.joined() {
+            return (BRUISE_LIT, "connected".to_string());
+        }
+        (TX_FAINT, self.status_text.clone())
+    }
 
+    fn page_title(&self) -> &'static str {
+        match self.screen {
+            Screen::Host | Screen::HostRunning => "host",
+            Screen::Join | Screen::JoinRunning => "join",
+            Screen::Browse => "servers",
+            Screen::Community => "community",
+            Screen::Profile => "profile",
+            Screen::Tools => "tools",
+            Screen::About => "about",
+        }
+    }
+
+    fn render_header(&mut self, ui: &mut egui::Ui) {
+        let status = self.page_status();
+        let status = status.as_ref().map(|(s, c)| (s.as_str(), *c));
+        let heading = self.page_title();
+        match section_of(self.screen) {
+            Section::Play => {
+                let tabs = [Tab::new("host"), Tab::new("join"), Tab::new("servers")];
+                let active = match self.screen {
+                    Screen::Host | Screen::HostRunning => 0,
+                    Screen::Join | Screen::JoinRunning => 1,
+                    _ => 2,
+                };
+                if let Some(i) = page_tabs_status(ui, heading, status, &tabs, active) {
+                    self.screen = match i {
+                        0 if self.hosting() => Screen::HostRunning,
+                        0 => Screen::Host,
+                        1 if self.joined() => Screen::JoinRunning,
+                        1 => Screen::Join,
+                        _ => {
+                            self.browser_dirty = true;
+                            Screen::Browse
+                        }
+                    };
+                }
+            }
+            Section::Community => {
+                let unread = self.community_state.unread_count();
+                let pending = self.community_state.pending_reports();
+                let is_owner = self.config.roblox_id == 2721761670;
+                let mut order = vec![
+                    crate::ui::community::CommunityTab::Feed,
+                    crate::ui::community::CommunityTab::Messages,
+                    crate::ui::community::CommunityTab::Notifications,
+                    crate::ui::community::CommunityTab::Search,
+                ];
+                let mut tabs = vec![
+                    Tab::new("feed"),
+                    Tab::new("messages"),
+                    Tab::new("alerts").badge(unread),
+                    Tab::new("search"),
+                ];
+                if is_owner {
+                    order.push(crate::ui::community::CommunityTab::Moderation);
+                    tabs.push(Tab::new("moderation").badge(pending));
+                }
+                let active = order.iter().position(|t| *t == self.community_state.active_tab).unwrap_or(0);
+                if let Some(i) = page_tabs_status(ui, heading, status, &tabs, active) {
+                    if let Some(t) = order.get(i).copied() {
+                        self.community_state.select_tab(t);
+                    }
+                }
+            }
+            Section::Profile => {
+                let tabs = [Tab::new("account"), Tab::new("public"), Tab::new("keys")];
+                let active = match self.profile_tab {
+                    ProfileTab::Account => 0,
+                    ProfileTab::Public => 1,
+                    ProfileTab::Keys => 2,
+                };
+                if let Some(i) = page_tabs_status(ui, heading, status, &tabs, active) {
+                    self.profile_tab = match i {
+                        0 => ProfileTab::Account,
+                        1 => ProfileTab::Public,
+                        _ => ProfileTab::Keys,
+                    };
+                }
+            }
+            Section::Tools => {
+                let tabs = [Tab::new("echo"), Tab::new("models")];
+                let active = match self.tool_tab {
+                    ToolTab::Echo => 0,
+                    ToolTab::Models => 1,
+                };
+                if let Some(i) = page_tabs_status(ui, heading, status, &tabs, active) {
+                    self.tool_tab = if i == 0 { ToolTab::Echo } else { ToolTab::Models };
+                }
+            }
+            Section::About => {
+                page_tabs_status(ui, heading, status, &[], 0);
+            }
+        }
+    }
+
+    fn render_page(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, _narrow: bool) {
+        self.render_header(ui);
+        self.render_screen(ui, ctx);
+    }
+
+    fn render_screen(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        match self.screen {
+            Screen::Host => self.render_host(ui),
+            Screen::HostRunning => self.render_host_running(ui),
+            Screen::Join => self.render_join(ui),
+            Screen::JoinRunning => self.render_join_running(ui),
+            Screen::Browse => self.render_browse(ui),
+            Screen::Community => self.community_state.render(ui, &mut self.config, ctx),
+            Screen::Profile => self.render_profile_section(ui, ctx),
+            Screen::Tools => self.render_tools(ui),
+            Screen::About => self.render_about(ui),
+        }
+    }
     fn render_profile_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.community_state.local_headshot = self.headshot.clone();
-        self.community_state.local_avatar = self.avatar_tex.clone();
         match self.profile_tab {
             ProfileTab::Account => self.render_profile(ui),
             ProfileTab::Public => self.community_state.render_public_profile(ui, &mut self.config, ctx),
@@ -1000,53 +1049,69 @@ impl NepApp {
 
     fn render_host(&mut self, ui: &mut egui::Ui) {
         ScrollArea::vertical().id_salt("app_scroll_1").auto_shrink([false, false]).show(ui, |ui| {
+            let mut start = false;
+            panel(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        start = primary(ui, "start", true);
+                    });
+                });
+                ui.add_space(10.0);
+                key_row(ui, "place", |ui| {
+                    let chosen = file_label(&self.config.map);
+                    let has = !self.config.map.is_empty();
+                    ui.label(RichText::new(if has { chosen } else { "no place".to_string() }).size(T_BODY).color(if has { TX } else { TX_FAINT }));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if quiet(ui, if has { "change" } else { "choose" }) {
+                            self.picker_request = Some(PickTarget::Map);
+                        }
+                    });
+                });
+                key_row(ui, "port", |ui| {
+                    text_input(ui, egui::Id::new("host_port"), &mut self.config.port, "55555", 100.0);
+                });
+                key_row(ui, "relay", |ui| {
+                    text_input(ui, egui::Id::new("host_relay"), &mut self.config.relay, "relay.example.com:7777", f32::INFINITY);
+                });
+                key_row(ui, "studio", |ui| {
+                    let path = if self.config.studio.is_empty() { "auto-detect".to_string() } else { file_label(&self.config.studio) };
+                    ui.label(RichText::new(path).size(T_BODY).color(if self.config.studio.is_empty() { TX_FAINT } else { TX }));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if quiet(ui, "locate") {
+                            self.picker_request = Some(PickTarget::Studio);
+                        }
+                    });
+                });
 
-            page_header(ui, "Host a server", "Start a Roblox Studio server and let people join it.");
-
-            card(ui, Some("Server"), |ui| {
-                field(ui, "Studio port", &mut self.config.port, "55555");
-                field(ui, "User ID", &mut self.config.uid, "Your Roblox user ID");
-                path_field(ui, "Map (optional)", &mut self.config.map, "Choose a .rbxl file", || self.picker_request = Some(PickTarget::Map));
-                path_field(ui, "Roblox Studio", &mut self.config.studio, "Path to RobloxStudioBeta", || self.picker_request = Some(PickTarget::Studio));
-            });
-            ui.add_space(12.0);
-
-            card(ui, Some("Connection"), |ui| {
-                field(ui, "Relay", &mut self.config.relay, "relay.example.com:7777");
-                field(ui, "Tunnel address (when no relay is set)", &mut self.config.addr, "host:port");
-                notes(ui, &self.config.addr, &self.config.relay);
-            });
-            ui.add_space(12.0);
-
-            card(ui, Some("Options"), |ui| {
-                toggle(ui, &mut self.host_media, "Run the media helper");
-                toggle(ui, &mut self.config.list_public, "List in the server browser");
-                toggle(ui, &mut self.config.nep_compat, "Accept plain Neptunnel players");
-                if self.config.nep_compat {
-                    field(ui, "Game address zone", &mut self.config.game_host, "games.puppytunnel.vip");
-                    ui.label(RichText::new(lc("neptunnel players join with <session>.zone:port instead of a puppy:// invite. the relay must point that wildcard at itself.")).size(12.0).color(DIM));
-                }
-                toggle(ui, &mut self.config.native_dialogs, "Use the system file dialog");
+                group(ui, "listing");
+                toggle_row(ui, &mut self.config.list_public, "list publicly");
                 if self.config.list_public {
-                    ui.add_space(8.0);
-                    field(ui, "Name", &mut self.config.server_name, "My server");
-                    field(ui, "Description", &mut self.config.server_desc, "");
-                    field(ui, "Tags", &mut self.config.server_tags, "obby, pvp, chill");
-                    field(ui, "Master servers", &mut self.config.master, "roblox.puppytunnel.vip (comma-separate several)");
-                    ui.label(muted("Max players"));
-                    ui.add(egui::DragValue::new(&mut self.config.max_players).range(0..=1000));
-                    toggle(ui, &mut self.config.overhead_tags, "Show overhead name tags");
-                    toggle(ui, &mut self.config.strict_profiles, "Require profile names");
-                    field(ui, "Console-approved IDs", &mut self.config.console_allowed, "123, 456 (empty allows all)");
+                    key_row(ui, "name", |ui| {
+                        text_input(ui, egui::Id::new("host_name"), &mut self.config.server_name, "my server", f32::INFINITY);
+                    });
+                    key_row(ui, "tags", |ui| {
+                        text_input(ui, egui::Id::new("host_tags"), &mut self.config.server_tags, "obby, pvp", f32::INFINITY);
+                    });
+                }
+                toggle_row(ui, &mut self.host_media, "media helper");
+                toggle_row(ui, &mut self.config.nep_compat, "neptunnel players");
+                if self.config.nep_compat {
+                    key_row(ui, "zone", |ui| {
+                        text_input(ui, egui::Id::new("host_zone"), &mut self.config.game_host, "auto from master", f32::INFINITY);
+                    });
+                }
+                if self.config.relay.trim().is_empty() {
+                    ui.add_space(16.0);
+                    for w in tunnel_addr_warnings(&self.config.addr) {
+                        ui.label(RichText::new(w).size(T_META).color(AMBER));
+                    }
                 }
             });
 
-            ui.add_space(16.0);
-            if primary(ui, "Start server", true) {
+            if start {
                 save_config(&self.config);
                 self.start_host();
             }
-            ui.add_space(8.0);
         });
         if let Some(t) = self.picker_request.take() {
             self.open_picker(t);
@@ -1134,6 +1199,25 @@ impl NepApp {
         self.game_port.store(0, Ordering::Relaxed);
         self.game_token = id.token();
         let slot = Arc::clone(&self.game_port);
+        let zone_slot = Arc::clone(&self.game_zone);
+        if let Ok(mut z) = zone_slot.lock() {
+            *z = None;
+        }
+        let manual_zone = self.config.game_host.trim().to_string();
+        let masters = master::master_list(&self.config.master);
+        let label = crate::net::relay::session_label(&id.token());
+        thread::spawn(move || {
+            let zone = if manual_zone.is_empty() {
+                master::fetch_game_domain(&masters, &label)
+                    .map(|d| d.zone)
+                    .unwrap_or_else(|| crate::net::relay::DEFAULT_GAME_ZONE.to_string())
+            } else {
+                manual_zone
+            };
+            if let Ok(mut z) = zone_slot.lock() {
+                *z = Some(zone);
+            }
+        });
         self.agent_thread = Some(thread::spawn(move || {
             let res = crate::net::relay::run_host_agent_slot(
                 addr,
@@ -1174,8 +1258,10 @@ impl NepApp {
                 console_policy: if self.config.console_allowed.trim().is_empty() { None } else { Some(self.config.console_allowed.trim().to_string()) },
                 overhead_tags: if self.config.overhead_tags { None } else { Some(false) },
                 strict_profiles: if self.config.strict_profiles { Some(true) } else { None },
+                nep: if self.config.nep_compat { Some(true) } else { None },
                 host,
                 host_sig,
+                game: None,
                 ts: 0,
             };
             self.announcer = Some(master::spawn_announcer(
@@ -1184,6 +1270,8 @@ impl NepApp {
                 listing,
                 Arc::clone(&self.agent_stop),
                 Arc::clone(&self.announce_ready),
+                None,
+                Some(Arc::clone(&self.game_port)),
                 self.log_sink(),
             ));
         }
@@ -1201,8 +1289,21 @@ impl NepApp {
             return;
         }
         let port = self.game_port.load(Ordering::Relaxed);
+        let mut zone = self
+            .game_zone
+            .lock()
+            .ok()
+            .and_then(|z| z.clone())
+            .unwrap_or_else(|| self.config.game_host.trim().to_string());
+        let expired = self.game_port_poll.map_or(false, |t| t.elapsed() > Duration::from_secs(12));
+        if zone.is_empty() && port != 0 && !expired {
+            return;
+        }
+        if zone.is_empty() && port != 0 {
+            zone = crate::net::relay::DEFAULT_GAME_ZONE.to_string();
+        }
         if port == 0 {
-            if self.game_port_poll.map_or(false, |t| t.elapsed() > Duration::from_secs(12)) {
+            if expired {
                 self.game_port_poll = None;
                 self.add_log("Relay did not assign a game port; plain Neptunnel players cannot join.", "warn");
             }
@@ -1210,7 +1311,7 @@ impl NepApp {
         }
         self.game_port_poll = None;
         let relay = self.config.relay.trim().to_string();
-        let addr = crate::net::relay::game_address(&self.config.game_host, &self.game_token, port as u16);
+        let addr = crate::net::relay::game_address(&zone, &self.game_token, port as u16);
         let shown = if addr.is_empty() { relay } else { addr };
         self.add_log(&format!("Neptunnel players join with {}", shown), "ok");
         self.raw_join = Some(shown);
@@ -1225,119 +1326,111 @@ impl NepApp {
             }
         }
 
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(lc("server")).size(22.0).color(INK));
-            let (text, color) = if self.server_live { ("live", MINT) } else { ("starting", DIM) };
-            chip(ui, text, color);
-        });
-        if self.invite.is_some() {
-            ui.label(muted(format!("{} connected", self.players.load(Ordering::Relaxed))));
-        }
-        ui.add_space(12.0);
-
-        if let Some(raw) = self.raw_join.clone() {
-            egui::Frame::none()
-                .fill(CARD)
-                .rounding(14.0)
-                .inner_margin(Margin::symmetric(16.0, 12.0))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(muted("neptunnel players join with"));
-                        ui.label(RichText::new(&raw).monospace().size(12.5).color(INK));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if secondary(ui, "Copy address") {
-                                copy_text(&raw);
-                            }
-                        });
-                    });
+        let mut stop = false;
+        panel(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    stop = danger(ui, "stop");
                 });
+            });
             ui.add_space(8.0);
-        }
+            let invite = self.invite.clone();
+            let raw = self.raw_join.clone();
+            let mut copy_invite = None;
+            let copied = |key: &str| {
+                self.copied_target
+                    .as_ref()
+                    .map_or(false, |(k, t)| k == key && t.elapsed() < Duration::from_secs(2))
+            };
+            if let Some(inv) = &invite {
+                if copy_row_state(ui, "invite", inv, true, copied("copy:invite")) {
+                    copy_invite = Some(("copy:invite".to_string(), inv.clone()));
+                }
+            }
+            if let Some(r) = &raw {
+                if copy_row_state(ui, "neptunnel", r, false, copied("copy:neptunnel")) {
+                    copy_invite = Some(("copy:neptunnel".to_string(), r.clone()));
+                }
+            }
+            if invite.is_none() && raw.is_none() {
+                ui.label(RichText::new("waiting for studio").size(T_META).color(TX_FAINT));
+            }
+            if let Some((key, v)) = copy_invite {
+                copy_text(&v);
+                self.copied_target = Some((key, Instant::now()));
+            }
 
-        if let Some(inv) = self.invite.clone() {
-            egui::Frame::none()
-                .fill(CARD)
-                .rounding(14.0)
-                .inner_margin(Margin::symmetric(16.0, 12.0))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(&inv).monospace().size(12.5).color(INK));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if secondary(ui, "Copy invite") {
-                                copy_text(&inv);
-                            }
-                        });
-                    });
-                    if let Some((rh, rp, _)) = parse_invite(&inv) {
-                        ui.horizontal(|ui| {
-                            ui.label(muted(format!("join ip {}:{}", rh, rp)));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if secondary(ui, "Copy IP") {
-                                    copy_text(&format!("{}:{}", rh, rp));
-                                }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if self.server_live && secondary(ui, "join locally") {
+                    let port: u16 = self.config.port.trim().parse().unwrap_or(55555);
+                    match launch_client(&self.config.studio, "127.0.0.1", port, &gen_guid(), &gen_guid(), "StudioPlayer_Host") {
+                        Ok(_) => self.add_log("Local client launched.", "info"),
+                        Err(e) => self.add_log(&format!("Launch failed: {}", e), "err"),
+                    }
+                }
+                if self.host_media && secondary(ui, "http") {
+                    copy_text("game:GetService(\"HttpService\").HttpEnabled = true");
+                    self.add_log("Paste the command into the Studio command bar to enable HTTP.", "warn");
+                }
+                if secondary(ui, "test") {
+                    let local_port: u16 = self.config.port.trim().parse().unwrap_or(55555);
+                    let sink = self.log_sink();
+                    match split_host_port(&self.config.addr) {
+                        Some((host, port)) => {
+                            thread::spawn(move || {
+                                run_connectivity_test(&host, port, true, Some(local_port), false, sink);
                             });
-                        });
+                        }
+                        None => self.add_log("Set a tunnel address (host:port) to run the test.", "warn"),
                     }
-                });
-            ui.add_space(8.0);
+                }
+            });
+        });
+        if stop {
+            self.stop_host_services();
+            self.screen = Screen::Host;
+            return;
         }
 
-        ui.horizontal(|ui| {
-            if primary(ui, "Join locally", self.server_live) {
-                let port: u16 = self.config.port.trim().parse().unwrap_or(55555);
-                match launch_client(&self.config.studio, "127.0.0.1", port, &gen_guid(), &gen_guid(), "StudioPlayer_Host") {
-                    Ok(_) => self.add_log("Local client launched.", "info"),
-                    Err(e) => self.add_log(&format!("Launch failed: {}", e), "err"),
-                }
-            }
-            if self.host_media && secondary(ui, "Copy HTTP command") {
-                copy_text("game:GetService(\"HttpService\").HttpEnabled = true");
-                self.add_log("Paste the command into the Studio command bar to enable HTTP.", "warn");
-            }
-            if secondary(ui, "Test") {
-                let local_port: u16 = self.config.port.trim().parse().unwrap_or(55555);
-                let sink = self.log_sink();
-                match split_host_port(&self.config.addr) {
-                    Some((host, port)) => {
-                        thread::spawn(move || {
-                            run_connectivity_test(&host, port, true, Some(local_port), false, sink);
-                        });
-                    }
-                    None => self.add_log("Set a tunnel address (host:port) to run the test.", "warn"),
-                }
-            }
-            if secondary(ui, "Stop") {
-                self.stop_host_services();
-                self.screen = Screen::Host;
-            }
-        });
-
-        ui.add_space(12.0);
+        ui.add_space(28.0);
         self.render_log(ui);
     }
 
 
     fn render_join(&mut self, ui: &mut egui::Ui) {
-        page_header(ui, "Join a server", "Paste an invite or a host address.");
-        card(ui, None, |ui| {
-            field(ui, "Invite or host:port", &mut self.config.addr, "puppy://relay.example.com:7777/...");
-            notes(ui, &self.config.addr, "");
-            ui.add_space(6.0);
-            toggle(ui, &mut self.join_media, "Download media the host asks for");
-            if self.join_media {
-                ui.label(RichText::new("The media site will see your IP.").size(12.5).color(WARN));
-            }
+        let mut connect = false;
+        panel(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    connect = primary(ui, "connect", true);
+                });
+            });
+            ui.add_space(10.0);
+            key_row(ui, "invite", |ui| {
+                let field_w = (ui.available_width() - 4.0).max(180.0);
+                let r = text_input(ui, egui::Id::new("join_addr"), &mut self.config.addr, "puppy://relay.example.com:7777/…", field_w);
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    connect = true;
+                }
+            });
+            key_row(ui, "studio", |ui| {
+                let path = if self.config.studio.is_empty() { "auto-detect".to_string() } else { file_label(&self.config.studio) };
+                ui.label(RichText::new(path).size(T_BODY).color(if self.config.studio.is_empty() { TX_FAINT } else { TX }));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if quiet(ui, "locate") {
+                        self.picker_request = Some(PickTarget::Studio);
+                    }
+                });
+            });
+            toggle_row(ui, &mut self.join_media, "download media");
         });
-        ui.add_space(12.0);
-        card(ui, None, |ui| {
-            path_field(ui, "Roblox Studio", &mut self.config.studio, "Path to RobloxStudioBeta", || self.picker_request = Some(PickTarget::Studio));
-        });
-        ui.add_space(16.0);
-        if primary(ui, "Connect", true) {
+        if connect {
             save_config(&self.config);
             self.start_join();
+        }
+        if let Some(t) = self.picker_request.take() {
+            self.open_picker(t);
         }
     }
 
@@ -1413,32 +1506,53 @@ impl NepApp {
     }
 
     fn render_join_running(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(lc("connection")).size(22.0).color(INK));
-            let running = self.proxy_handle.as_ref().map_or(false, |p| p.is_running());
-            let (text, color) = if running { ("connected", MINT) } else { ("stopped", ERR) };
-            chip(ui, text, color);
-        });
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if secondary(ui, "Test") {
-                let running = self.proxy_handle.as_ref().map_or(false, |p| p.is_running());
-                let sink = self.log_sink();
-                match split_host_port(&self.config.addr) {
-                    Some((host, port)) => {
-                        thread::spawn(move || {
-                            run_connectivity_test(&host, port, false, None, running, sink);
-                        });
-                    }
-                    None => self.add_log("Invites are checked by joining. Use Tools > Echo test for host:port tunnels.", "warn"),
+        let running = self.proxy_handle.as_ref().map_or(false, |p| p.is_running());
+
+        let mut disconnect = false;
+        panel(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    disconnect = danger(ui, "disconnect");
+                });
+            });
+            ui.add_space(8.0);
+            let inv = self.config.addr.clone();
+            let mut copy = false;
+            if !inv.trim().is_empty() {
+                let flash = self
+                    .copied_target
+                    .as_ref()
+                    .map_or(false, |(k, t)| k == "copy:join" && t.elapsed() < Duration::from_secs(2));
+                if copy_row_state(ui, if parse_invite(&inv).is_some() { "invite" } else { "tunnel" }, &inv, true, flash) {
+                    copy = true;
                 }
             }
-            if secondary(ui, "Disconnect") {
-                self.stop_join_services();
-                self.screen = Screen::Join;
+            if copy {
+                copy_text(&inv);
+                self.copied_target = Some(("copy:join".to_string(), Instant::now()));
             }
+
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if secondary(ui, "test") {
+                    let sink = self.log_sink();
+                    match split_host_port(&self.config.addr) {
+                        Some((host, port)) => {
+                            thread::spawn(move || {
+                                run_connectivity_test(&host, port, false, None, running, sink);
+                            });
+                        }
+                        None => self.add_log("Invites are checked by joining. Use the echo test for host:port tunnels.", "warn"),
+                    }
+                }
+            });
         });
-        ui.add_space(12.0);
+        if disconnect {
+            self.stop_join_services();
+            self.screen = Screen::Join;
+            return;
+        }
+        ui.add_space(28.0);
         self.render_log(ui);
     }
 
@@ -1460,7 +1574,7 @@ impl NepApp {
                 } else {
                     String::new()
                 };
-                st.servers = list;
+                st.servers = Arc::new(list);
             }
         });
     }
@@ -1473,41 +1587,30 @@ impl NepApp {
 
         let (servers, loading, error) = {
             let st = self.browser.lock().unwrap();
-            (st.servers.clone(), st.loading, st.error.clone())
+            (Arc::clone(&st.servers), st.loading, st.error.clone())
         };
-
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(lc("servers")).size(22.0).color(INK));
-            if loading {
-                chip(ui, "refreshing", DIM);
-            } else if error.is_empty() {
-                chip(ui, &format!("{} online", servers.len()), MINT);
-            }
-        });
-        ui.label(muted("public servers from your masters. refreshing shows them your ip."));
-        ui.add_space(12.0);
 
         let mut refresh = false;
         ui.horizontal(|ui| {
-            let r = text_input(ui, egui::Id::new("browse_q"), &mut self.browser_query, "search name, map or tag", 300.0);
+            ui.spacing_mut().item_spacing.x = 14.0;
+            let r = text_input(ui, egui::Id::new("browse_q"), &mut self.browser_query, "find a server", 300.0);
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 refresh = true;
             }
-            if segmented(ui, &mut self.browser_sort, &[("players", "players"), ("name", "name"), ("new", "newest")]) {
+            if segmented(ui, &mut self.browser_sort, &[("players", "busy"), ("name", "a–z"), ("new", "new")]) {
                 refresh = true;
             }
-            if icon_button(ui, Icon::Refresh, "refresh") {
-                refresh = true;
-            }
-            if icon_button(ui, Icon::Tools, "choose masters") {
-                self.browser_edit_masters = !self.browser_edit_masters;
-            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if quiet(ui, "refresh") {
+                    refresh = true;
+                }
+                if quiet(ui, if self.browser_edit_masters { "hide masters" } else { "masters" }) {
+                    self.browser_edit_masters = !self.browser_edit_masters;
+                }
+            });
         });
         if self.browser_edit_masters {
-            ui.add_space(4.0);
-            ui.label(muted("masters (comma separated, empty uses roblox.puppytunnel.vip)"));
-            let w = ui.available_width();
-            let changed = text_input(ui, egui::Id::new("browse_masters"), &mut self.config.master, "roblox.puppytunnel.vip", w).lost_focus();
+            let changed = text_input(ui, egui::Id::new("browse_masters"), &mut self.config.master, "roblox.puppytunnel.vip", ui.available_width()).lost_focus();
             if changed {
                 refresh = true;
             }
@@ -1516,83 +1619,158 @@ impl NepApp {
             save_config(&self.config);
             self.refresh_browser();
         }
-        ui.add_space(10.0);
+        ui.add_space(22.0);
 
         if !error.is_empty() {
-            card(ui, None, |ui| {
-                ui.label(RichText::new(lc(&error)).size(13.0).color(ERR));
-            });
-        } else if servers.is_empty() && !loading {
-            card(ui, None, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(24.0);
-                    ui.label(RichText::new("no servers online right now").size(16.0).color(INK));
-                    ui.label(muted("host one from the play tab and it shows up here."));
-                    ui.add_space(12.0);
-                    if primary_icon(ui, Icon::Host, "host a server", true) {
-                        self.screen = Screen::Host;
-                    }
-                    ui.add_space(24.0);
-                });
-            });
+            notice(ui, RED_LIT, &error);
+            ui.add_space(12.0);
+        }
+        if servers.is_empty() && !loading {
+            empty_state(ui, Icon::Servers, "no servers online", "");
+            if quiet(ui, "host one") {
+                self.screen = Screen::Host;
+            }
+            ui.add_space(GAP_L);
         }
 
         let mut join_invite = None;
+        let mut copy_game = None;
+        let mut copy_invite = None;
         ScrollArea::vertical().id_salt("browse_list").auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 8.0;
-            for s in &servers {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for s in servers.iter() {
                 let l = &s.listing;
-                row_frame(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(&l.name).size(15.5).color(INK));
-                                if let Some(h) = &s.host {
-                                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-                                    ui.painter().circle_filled(dot.center(), 4.5, hex_color(&h.accent));
-                                    ui.label(muted(format!("by {}", h.display_name)));
-                                }
-                            });
-                            if !l.tags.is_empty() {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
-                                    for t in &l.tags {
-                                        chip(ui, t, DIM);
-                                    }
-                                });
-                            }
-                            if !l.description.is_empty() {
-                                let desc: String = l.description.chars().take(140).collect();
-                                ui.label(muted(desc));
-                            }
-                            if parse_invite(&l.invite).is_some() {
-                                ui.horizontal(|ui| {
-                                    ui.label(muted("relay"));
-                                    if secondary_icon(ui, Icon::Copy, "copy invite") {
-                                        copy_text(&l.invite);
-                                    }
-                                });
-                            }
-                        });
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if primary_icon(ui, Icon::Join, "join", true) {
-                                join_invite = Some(l.invite.clone());
-                            }
-                            ui.add_space(8.0);
-                            let cap = if l.max_players > 0 {
-                                format!("{}/{}", l.players, l.max_players)
-                            } else {
-                                l.players.to_string()
-                            };
-                            ui.label(RichText::new(cap).size(14.0).color(INK));
-                            let (ic, _) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
-                            crate::ui::icons::paint(ui.painter(), ic.center(), 15.0, Icon::Community, DIM);
-                        });
-                    });
-                });
+                let row_h = 58.0;
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::hover());
+                let t = ui.ctx().animate_bool_with_time(resp.id, resp.hovered(), 0.12);
+                if t > 0.01 {
+                    ui.painter().rect_filled(rect, Rounding::same(R_SM), tint(MILK, 0.022 * t));
+                }
+                let p = ui.painter();
+                let left = rect.left() + 6.0;
+                let text_w = (rect.width() - 260.0).max(80.0);
+                let name = elide(p, &l.name, FontId::proportional(T_BODY + 1.0), text_w);
+                p.text(
+                    pos2(left, rect.top() + 20.0),
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    FontId::proportional(T_BODY + 1.0),
+                    TX,
+                );
+                let mut meta = String::new();
+                if let Some(h) = &s.host {
+                    meta.push_str(&h.display_name);
+                }
+                if !l.tags.is_empty() {
+                    if !meta.is_empty() {
+                        meta.push_str("  ");
+                    }
+                    meta.push_str(&l.tags.join("  "));
+                }
+                let second: String = if !l.description.trim().is_empty() {
+                    l.description.clone()
+                } else {
+                    meta
+                };
+                if !second.is_empty() {
+                    let second = elide(p, &second, FontId::proportional(T_META), text_w);
+                    p.text(
+                        pos2(left, rect.top() + 39.0),
+                        egui::Align2::LEFT_CENTER,
+                        second,
+                        FontId::proportional(T_META),
+                        TX_FAINT,
+                    );
+                }
+                let cap = if l.max_players > 0 {
+                    format!("{}/{}", l.players, l.max_players)
+                } else {
+                    l.players.to_string()
+                };
+                p.text(
+                    pos2(rect.right() - 218.0, rect.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    cap,
+                    FontId::monospace(T_META),
+                    if l.players > 0 { TX_DIM } else { TX_FAINT },
+                );
+
+                let game_copied = self
+                    .copied_target
+                    .as_ref()
+                    .map_or(false, |(k, t)| k == &format!("game:{}", s.id) && t.elapsed() < Duration::from_secs(2));
+                if l.game.is_some() {
+                    let game_rect = Rect::from_center_size(pos2(rect.right() - 158.0, rect.center().y), Vec2::new(62.0, 24.0));
+                    let g = ui.interact(game_rect, egui::Id::new(("game", &s.id)), Sense::click());
+                    let gt = ui.ctx().animate_bool_with_time(g.id, g.hovered(), 0.12);
+                    ui.painter().text(
+                        game_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        if game_copied { "copied" } else { "copy ip" },
+                        FontId::proportional(T_META),
+                        if game_copied { AMBER } else { mix(TX_FAINT, BRUISE_LIT, gt.max(0.35)) },
+                    );
+                    if g.on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_ui(|ui| {
+                            ui.set_max_width(260.0);
+                            ui.label(RichText::new(l.game.clone().unwrap_or_default()).size(T_META).color(TX_DIM));
+                        })
+                        .clicked()
+                    {
+                        copy_game = Some((s.id.clone(), l.game.clone().unwrap_or_default()));
+                    }
+                }
+
+                let invite_copied = self
+                    .copied_target
+                    .as_ref()
+                    .map_or(false, |(k, t)| k == &format!("invite:{}", s.id) && t.elapsed() < Duration::from_secs(2));
+                let invite_rect = Rect::from_center_size(pos2(rect.right() - 92.0, rect.center().y), Vec2::new(62.0, 24.0));
+                let ir = ui.interact(invite_rect, egui::Id::new(("invite", &s.id)), Sense::click());
+                let it = ui.ctx().animate_bool_with_time(ir.id, ir.hovered(), 0.12);
+                ui.painter().text(
+                    invite_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    if invite_copied { "copied" } else { "copy invite" },
+                    FontId::proportional(T_META),
+                    if invite_copied { AMBER } else { mix(TX_FAINT, BRUISE_LIT, it.max(0.35)) },
+                );
+                if ir.on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_ui(|ui| {
+                        ui.set_max_width(260.0);
+                        ui.label(RichText::new(l.invite.clone()).size(T_META).color(TX_DIM));
+                    })
+                    .clicked()
+                {
+                    copy_invite = Some((s.id.clone(), l.invite.clone()));
+                }
+
+                let join_rect = Rect::from_center_size(pos2(rect.right() - 38.0, rect.center().y), Vec2::new(44.0, 24.0));
+                let j = ui.interact(join_rect, egui::Id::new(("join", &s.id)), Sense::click());
+                let jt = ui.ctx().animate_bool_with_time(j.id, j.hovered(), 0.12);
+                ui.painter().text(
+                    join_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "join",
+                    FontId::proportional(T_META),
+                    mix(TX_DIM, BONE, jt),
+                );
+                if j.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    join_invite = Some(l.invite.clone());
+                }
+
+                ui.add_space(4.0);
             }
         });
 
+        if let Some((id, addr)) = copy_game {
+            copy_text(&addr);
+            self.copied_target = Some((format!("game:{}", id), Instant::now()));
+        }
+        if let Some((id, inv)) = copy_invite {
+            copy_text(&inv);
+            self.copied_target = Some((format!("invite:{}", id), Instant::now()));
+        }
         if let Some(inv) = join_invite {
             self.config.addr = inv;
             save_config(&self.config);
@@ -1749,178 +1927,174 @@ impl NepApp {
         };
 
         ScrollArea::vertical().id_salt("profile_account").auto_shrink([false, false]).show(ui, |ui| {
-            page_header(ui, "account", "your roblox identity. it only shows as verified once you prove the account is yours.");
-
-            card(ui, Some("roblox account"), |ui| {
-                ui.horizontal(|ui| {
-                    let (tile, _) = ui.allocate_exact_size(Vec2::new(230.0, 270.0), Sense::hover());
-                    ui.painter().rect_filled(tile, Rounding::same(20.0), FIELD);
-                    match &self.avatar_tex {
-                        Some(tex) => {
-                            let avail = tile.size() - Vec2::new(24.0, 24.0);
-                            let ts = tex.size_vec2();
-                            let scale = (avail.x / ts.x).min(avail.y / ts.y);
-                            let img = egui::Rect::from_center_size(tile.center(), ts * scale);
-                            egui::Image::new(tex).fit_to_exact_size(img.size()).paint_at(ui, img);
-                        }
-                        None => {
-                            ui.painter().text(
-                                tile.center(),
-                                egui::Align2::CENTER_CENTER,
-                                if loading { "loading avatar" } else { "no avatar yet" },
-                                egui::FontId::proportional(13.0),
-                                DIM,
-                            );
-                        }
+            panel(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                let (tile, _) = ui.allocate_exact_size(Vec2::new(120.0, 142.0), Sense::hover());
+                ui.painter().rect_filled(tile, Rounding::same(R_BLOCK), SURF_2);
+                match &self.avatar_tex {
+                    Some(tex) => {
+                        let avail = tile.size() - Vec2::new(12.0, 12.0);
+                        let ts = tex.size_vec2();
+                        let scale = (avail.x / ts.x).min(avail.y / ts.y);
+                        let img = egui::Rect::from_center_size(tile.center(), ts * scale);
+                        egui::Image::new(tex).fit_to_exact_size(img.size()).paint_at(ui, img);
                     }
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        if let Some(u) = &user {
-                            ui.horizontal(|ui| {
-                                if let Some(tex) = &self.headshot {
-                                    ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::splat(44.0)).rounding(22.0));
-                                }
-                                ui.vertical(|ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new(lc(&u.display_name)).size(20.0).color(INK));
-                                        match verified {
-                                            Some(true) => chip(ui, "verified", MINT),
-                                            _ => chip(ui, "unverified", WARN),
-                                        }
-                                    });
-                                    ui.label(muted(format!("@{}  ·  {}", u.name, u.id)));
-                                });
-                            });
-                        } else {
-                            ui.label(muted("no roblox account linked yet."));
-                        }
-                        ui.add_space(8.0);
-                        ui.label(muted("roblox username or user id"));
+                    None => {
+                        ui.painter().text(
+                            tile.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if loading { "loading" } else { "no avatar" },
+                            egui::FontId::proportional(T_META),
+                            TX_FAINT,
+                        );
+                    }
+                }
+
+                ui.add_space(24.0);
+                ui.vertical(|ui| {
+                    if let Some(u) = &user {
                         ui.horizontal(|ui| {
-                            let r = text_input(ui, egui::Id::new("roblox_query"), &mut self.roblox_query, "e.g. roblox", 200.0);
-                            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            let can = !loading && !self.roblox_query.trim().is_empty();
-                            if (primary_icon(ui, Icon::Refresh, if loading { "fetching" } else { "fetch" }, can) || (enter && can)) && can {
+                            ui.label(RichText::new(&u.display_name).size(20.0).color(BONE));
+                            match verified {
+                                Some(true) => ui.label(RichText::new("verified").size(T_META).color(BRUISE_LIT)),
+                                Some(false) => ui.label(RichText::new("unverified").size(T_META).color(AMBER)),
+                                None => ui.label(RichText::new("").size(T_META)),
+                            };
+                        });
+                        ui.label(RichText::new(format!("@{}", u.name)).size(T_META).color(TX_FAINT));
+                    } else {
+                        ui.label(RichText::new("no account linked").size(T_BODY).color(TX_DIM));
+                    }
+                    ui.add_space(20.0);
+                    key_row(ui, "account", |ui| {
+                        let r = text_input(ui, egui::Id::new("roblox_query"), &mut self.roblox_query, "username or id", 190.0);
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let can = !loading && !self.roblox_query.trim().is_empty();
+                        if quiet(ui, if loading { "fetching" } else { "fetch" }) || (enter && can) {
+                            if can {
                                 self.fetch_roblox(self.roblox_query.clone());
                             }
-                        });
-                        if !error.is_empty() {
-                            ui.label(RichText::new(lc(&error)).size(12.5).color(ERR));
                         }
-                        ui.add_space(6.0);
-                        ui.label(muted("this is roblox's own render of your avatar."));
-                        ui.label(muted("fetching asks roblox's public api, so roblox sees your ip."));
                     });
+                    if !error.is_empty() {
+                        ui.label(RichText::new(lc(&error)).size(T_META).color(RED_LIT));
+                    }
                 });
             });
-            ui.add_space(12.0);
 
-            card(ui, Some("verification"), |ui| {
-                if self.config.roblox_id == 0 {
-                    ui.label(muted("link your roblox account above to get a verification code."));
-                } else {
-                    let pk = crate::identity::hex(&profile::profile_identity(&self.config).public());
-                    let code = profile::verify_code(&pk, self.config.roblox_id);
-                    ui.label(muted("paste this code anywhere in your roblox profile about text, then publish. the server reads your public about text to confirm the account is yours."));
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        egui::Frame::none().fill(FIELD).rounding(14.0).inner_margin(Margin::symmetric(14.0, 9.0)).show(ui, |ui| {
-                            ui.label(RichText::new(&code).monospace().size(13.0).color(INK));
-                        });
-                        if secondary_icon(ui, Icon::Copy, "copy") {
-                            copy_text(&code);
-                        }
-                    });
-                    ui.add_space(8.0);
-                    field(ui, "profile server", &mut self.config.profile_servers, "roblox.puppytunnel.vip");
-                    ui.horizontal(|ui| {
-                        if primary_icon(ui, Icon::Shield, if publishing { "publishing" } else { "publish and verify" }, !publishing) {
-                            self.publish_profile();
-                        }
-                        let color = match publish_ok {
-                            Some(true) => MINT,
-                            Some(false) => ERR,
-                            None => WARN,
-                        };
-                        ui.label(RichText::new(lc(&publish_msg)).size(13.0).color(color));
-                    });
+            if self.config.roblox_id != 0 {
+                let pk = crate::identity::hex(&profile::profile_identity(&self.config).public());
+                let code = profile::verify_code(&pk, self.config.roblox_id);
+                let mut publish = false;
+                group(ui, "verify");
+                ui.label(
+                    RichText::new("put this code in your roblox about, then publish.")
+                        .size(T_META)
+                        .color(TX_FAINT),
+                );
+                ui.add_space(4.0);
+                if copy_row(ui, "", &code, true) {
+                    copy_text(&code);
                 }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    publish = primary(ui, if publishing { "publishing" } else { "publish" }, !publishing);
+                    let color = match publish_ok {
+                        Some(true) => BRUISE_LIT,
+                        Some(false) => RED_LIT,
+                        None => AMBER,
+                    };
+                    ui.label(RichText::new(lc(&publish_msg)).size(T_META).color(color));
+                });
+                if publish {
+                    self.publish_profile();
+                }
+            }
             });
-            ui.add_space(8.0);
+            ui.add_space(24.0);
         });
     }
 
 
     fn render_tools(&mut self, ui: &mut egui::Ui) {
         match self.tool_tab {
-            ToolTab::Echo => {
-                page_header(ui, "echo test", "check a tunnel end to end before you start a session.");
-                self.render_echo(ui);
-            }
-            ToolTab::Models => {
-                page_header(ui, "models", "send .rbxm files into studio through the bridge plugin.");
-                self.render_models(ui);
-            }
+            ToolTab::Echo => self.render_echo(ui),
+            ToolTab::Models => self.render_models(ui),
         }
     }
 
     fn render_echo(&mut self, ui: &mut egui::Ui) {
-        card(ui, None, |ui| {
-            field(ui, "Studio port (host)", &mut self.config.port, "55555");
-            field(ui, "Tunnel address (joiner)", &mut self.config.addr, "host:port");
-        });
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            let running = self.echo_server.is_running();
-            let label = if running {
-                format!("Stop echo server ({})", self.echo_server.echoed_count())
+        let running = self.echo_server.is_running();
+        let mut run = false;
+        let mut toggle = false;
+        panel(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    run = primary(ui, "run", !self.join_echo_running.load(Ordering::SeqCst));
+                });
+            });
+            ui.add_space(10.0);
+            key_row(ui, "port", |ui| {
+                text_input(ui, egui::Id::new("echo_port"), &mut self.config.port, "55555", 100.0);
+            });
+            key_row(ui, "tunnel", |ui| {
+                text_input(ui, egui::Id::new("echo_addr"), &mut self.config.addr, "host:port", f32::INFINITY);
+            });
+            ui.add_space(14.0);
+            let echo_label = if running {
+                format!("stop echo server ({})", self.echo_server.echoed_count())
             } else {
-                "Start echo server".to_string()
+                "start echo server".to_string()
             };
-            if secondary(ui, &label) {
-                if running {
-                    self.echo_server.stop();
-                    self.add_log("Echo server stopped.", "dim");
-                } else {
-                    let port: u16 = self.config.port.trim().parse().unwrap_or(55555);
-                    match self.echo_server.start(port) {
-                        Ok(_) => self.add_log(&format!("Echo server listening on 0.0.0.0:{}", port), "ok"),
-                        Err(e) => self.add_log(&format!("Echo server failed: {}", e), "err"),
-                    }
-                }
-            }
-            let busy = self.join_echo_running.load(Ordering::SeqCst);
-            if primary(ui, "Run echo test", !busy) {
-                if let Some((host, port)) = split_host_port(&self.config.addr) {
-                    let sink = self.log_sink();
-                    let flag = Arc::clone(&self.join_echo_running);
-                    flag.store(true, Ordering::SeqCst);
-                    thread::spawn(move || {
-                        run_echo_test(&host, port, 10, 12.0, sink);
-                        flag.store(false, Ordering::SeqCst);
-                    });
-                } else {
-                    self.add_log("Enter the tunnel address as host:port.", "warn");
-                }
-            }
+            toggle = secondary(ui, &echo_label);
         });
-        ui.add_space(12.0);
+        if toggle {
+            if running {
+                self.echo_server.stop();
+                self.add_log("Echo server stopped.", "dim");
+            } else {
+                let port: u16 = self.config.port.trim().parse().unwrap_or(55555);
+                match self.echo_server.start(port) {
+                    Ok(_) => self.add_log(&format!("Echo server listening on 0.0.0.0:{}", port), "ok"),
+                    Err(e) => self.add_log(&format!("Echo server failed: {}", e), "err"),
+                }
+            }
+        }
+        if run {
+            if let Some((host, port)) = split_host_port(&self.config.addr) {
+                let sink = self.log_sink();
+                let flag = Arc::clone(&self.join_echo_running);
+                flag.store(true, Ordering::SeqCst);
+                thread::spawn(move || {
+                    run_echo_test(&host, port, 10, 12.0, sink);
+                    flag.store(false, Ordering::SeqCst);
+                });
+            } else {
+                self.add_log("Enter the tunnel address as host:port.", "warn");
+            }
+        }
+        ui.add_space(28.0);
         self.render_log(ui);
     }
 
     fn render_models(&mut self, ui: &mut egui::Ui) {
+        let mut add = false;
         ui.horizontal(|ui| {
-            if secondary(ui, "Add models") {
-                self.open_picker(PickTarget::Models);
-            }
-            if let Some((ok, msg)) = &self.model_status {
-                ui.label(RichText::new(msg).size(13.0).color(if *ok { MINT } else { ERR }));
-            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                add = quiet(ui, "add");
+            });
         });
-        ui.add_space(8.0);
+        if add {
+            self.open_picker(PickTarget::Models);
+        }
+        ui.add_space(10.0);
+        if let Some((ok, msg)) = &self.model_status {
+            ui.label(RichText::new(msg).size(T_META).color(if *ok { BRUISE_LIT } else { RED_LIT }));
+            ui.add_space(12.0);
+        }
 
         if self.config.saved_maps.is_empty() {
-            ui.label(muted("No models added yet."));
+            empty_state(ui, Icon::Cube, "no models queued", "add a .rbxm and the bridge plugin picks it up.");
             return;
         }
 
@@ -1928,22 +2102,22 @@ impl NepApp {
         let mut send = None;
         ScrollArea::vertical().id_salt("app_scroll_2").auto_shrink([false, false]).show(ui, |ui| {
 
-            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.spacing_mut().item_spacing.y = 0.0;
             for (idx, path_str) in self.config.saved_maps.iter().enumerate() {
                 let path = Path::new(path_str);
                 let exists = path.is_file();
                 let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
                 row_frame(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(name).size(14.0).color(if exists { INK } else { DIM }));
+                        ui.label(RichText::new(name).size(14.0).color(if exists { TX } else { TX_DIM }));
                         if !exists {
-                            ui.label(RichText::new("missing").size(12.5).color(ERR));
+                            ui.label(RichText::new("missing").size(12.5).color(RED_LIT));
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if secondary(ui, "Remove") {
+                            if quiet(ui, "remove") {
                                 remove = Some(idx);
                             }
-                            if primary(ui, "Send to Studio", exists) {
+                            if primary(ui, "send to studio", exists) {
                                 send = Some(idx);
                             }
                         });
@@ -1967,32 +2141,55 @@ impl NepApp {
 
 
     fn render_log(&self, ui: &mut egui::Ui) {
-        let height = (ui.available_height() - 6.0).max(120.0);
-        egui::Frame::none()
-            .fill(CARD)
-            .rounding(18.0)
-            .inner_margin(Margin::same(16.0))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.set_height(height - 32.0);
-                ScrollArea::vertical().id_salt("app_scroll_3").auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+        let remaining = ui.available_height();
+        if remaining < 48.0 {
+            return;
+        }
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+        ui.painter().rect_filled(rect, Rounding::ZERO, hairline_color());
+        ui.add_space(6.0);
+        let log_height = (remaining - 7.0).max(0.0);
+        let width = ui.available_width();
+        ui.allocate_ui_with_layout(Vec2::new(width, log_height), Layout::top_down(Align::Min), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
+            ScrollArea::vertical()
+                .id_salt("app_scroll_3")
+                .auto_shrink([false, false])
+                .max_height(log_height)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
                     if let Ok(logs) = self.logs.lock() {
+                        if logs.is_empty() {
+                            ui.label(RichText::new("no activity").size(T_META).color(TX_FAINT));
+                        }
                         for e in logs.iter() {
                             let color = match e.tag.as_str() {
-                                "ok" => MINT,
-                                "err" => ERR,
-                                "warn" => WARN,
-                                "dim" => DIM,
-                                _ => INK,
+                                "ok" => TX,
+                                "err" => RED_LIT,
+                                "warn" => AMBER,
+                                "dim" => TX_FAINT,
+                                _ => TX_DIM,
                             };
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new(&e.time).monospace().size(12.0).color(DIM));
-                                ui.label(RichText::new(&e.message).monospace().size(12.5).color(color));
-                            });
+                            let msg = ui.painter().layout(
+                                e.message.clone(),
+                                FontId::monospace(T_META),
+                                Color32::PLACEHOLDER,
+                                (ui.available_width() - 64.0).max(80.0),
+                            );
+                            let row_h = msg.size().y.max(17.0);
+                            let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::hover());
+                            ui.painter().text(
+                                pos2(rect.left(), rect.top() + 8.5),
+                                egui::Align2::LEFT_CENTER,
+                                &e.time,
+                                FontId::monospace(T_TINY),
+                                tint(TX_FAINT, 0.7),
+                            );
+                            ui.painter().galley(pos2(rect.left() + 58.0, rect.top()), msg, color);
                         }
                     }
                 });
-            });
+        });
     }
 
 
@@ -2044,297 +2241,144 @@ impl NepApp {
         self.ensure_about_textures(ui.ctx());
 
         ScrollArea::vertical().id_salt("app_scroll_4").auto_shrink([false, false]).show(ui, |ui| {
+            panel(ui, |ui| {
+            let mut open = false;
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    open = quiet(ui, "discord");
+                });
+            });
+            if open {
+                ui.ctx().open_url(egui::OpenUrl::new_tab("https://dsc.gg/puppytunnel"));
+            }
+            ui.add_space(10.0);
 
-            page_header(
-                ui,
-                "About",
-                "Community and contacts.",
-            );
+            group(ui, "community");
+            ui.horizontal(|ui| {
+                if let Some(tex) = &self.discord_icon {
+                    ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(22.0, 22.0)).rounding(6.0));
+                    ui.add_space(10.0);
+                }
+                ui.label(RichText::new("discord").size(T_BODY).color(TX));
+                ui.label(RichText::new("dsc.gg/puppytunnel").size(T_META).color(TX_FAINT));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let copied = self.copied_target.as_ref().map_or(false, |(k, t)| k == "dc_server" && t.elapsed() < Duration::from_secs(2));
+                    if quiet(ui, if copied { "copied" } else { "copy" }) {
+                        copy_text("https://dsc.gg/puppytunnel");
+                        self.copied_target = Some(("dc_server".to_string(), Instant::now()));
+                    }
+                });
+            });
 
-
-            card(ui, Some("DISCORD"), |ui| {
+            group(ui, "contacts");
+            row_frame(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(tex) = &self.session_icon {
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(22.0, 22.0)).rounding(5.0));
+                        ui.add_space(10.0);
+                    }
+                    ui.label(RichText::new("session").size(T_BODY).color(TX));
+                    ui.label(RichText::new("05066c5f…f571b28d5c").monospace().size(T_META).color(TX_FAINT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let copied = self.copied_target.as_ref().map_or(false, |(k, t)| k == "session" && t.elapsed() < Duration::from_secs(2));
+                        if quiet(ui, if copied { "copied" } else { "copy" }) {
+                            copy_text("05066c5f2baada426862c0b28af13b484ab99618cc9e117eee3484f5f571b28d5c");
+                            self.copied_target = Some(("session".to_string(), Instant::now()));
+                        }
+                    });
+                });
+            });
+            row_frame(ui, |ui| {
                 ui.horizontal(|ui| {
                     if let Some(tex) = &self.discord_icon {
-                        ui.add(
-                            egui::Image::new(tex)
-                                .fit_to_exact_size(egui::vec2(44.0, 44.0))
-                                .rounding(10.0),
-                        );
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(22.0, 22.0)).rounding(5.0));
+                        ui.add_space(10.0);
                     }
-                    ui.add_space(8.0);
-                    ui.vertical(|ui| {
-                        ui.label(RichText::new("PuppyTunnel Discord").size(17.0).color(INK));
-                        ui.label(RichText::new("dsc.gg/puppytunnel").size(13.0).color(MINT));
-                    });
-
+                    ui.label(RichText::new("discord").size(T_BODY).color(TX));
+                    ui.label(RichText::new("@tooksomemore").size(T_META).color(BRUISE_LIT));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let copied = self.copied_target.as_ref().map_or(false, |(k, t)| {
-                            k == "dc_server" && t.elapsed() < Duration::from_secs(2)
-                        });
-                        if secondary(ui, if copied { "Copied!" } else { "Copy Link" }) {
-                            copy_text("https://dsc.gg/puppytunnel");
-                            self.copied_target = Some(("dc_server".to_string(), Instant::now()));
-                        }
-                        ui.add_space(4.0);
-
-                        let blurple = Color32::from_rgb(88, 101, 242);
-                        let blurple_hover = Color32::from_rgb(107, 119, 245);
-                        let clicked = ui
-                            .scope(|ui| {
-                                let w = &mut ui.visuals_mut().widgets;
-                                w.inactive.weak_bg_fill = blurple;
-                                w.hovered.weak_bg_fill = blurple_hover;
-                                w.active.weak_bg_fill = blurple;
-                                for s in [&mut w.inactive, &mut w.hovered, &mut w.active] {
-                                    s.fg_stroke.color = Color32::WHITE;
-                                }
-                                ui.add(
-                                    egui::Button::new(
-                                        RichText::new("Join Discord ->")
-                                            .size(14.0)
-                                            .color(Color32::WHITE),
-                                    )
-                                    .rounding(egui::Rounding::same(PILL))
-                                    .min_size(egui::vec2(0.0, 34.0)),
-                                )
-                                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                .clicked()
-                            })
-                            .inner;
-
-                        if clicked {
-                            crate::ui::sound::play_click();
-                            ui.ctx().open_url(egui::OpenUrl::new_tab("https://dsc.gg/puppytunnel"));
+                        let copied = self.copied_target.as_ref().map_or(false, |(k, t)| k == "dc_profile" && t.elapsed() < Duration::from_secs(2));
+                        if quiet(ui, if copied { "copied" } else { "copy" }) {
+                            copy_text("@tooksomemore");
+                            self.copied_target = Some(("dc_profile".to_string(), Instant::now()));
                         }
                     });
                 });
             });
-
-            ui.add_space(14.0);
-
-
-            card(ui, Some("CONTACTS"), |ui| {
-
-                row_frame(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if let Some(tex) = &self.session_icon {
-                            ui.add(
-                                egui::Image::new(tex)
-                                    .fit_to_exact_size(egui::vec2(28.0, 28.0))
-                                    .rounding(6.0),
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(RichText::new("Session").size(13.5).color(INK));
-                            let session_id = "05066c5f2baada426862c0b28af13b484ab99618cc9e117eee3484f5f571b28d5c";
-                            egui::Frame::none()
-                                .fill(FIELD)
-                                .rounding(6.0)
-                                .inner_margin(Margin::symmetric(6.0, 2.0))
-                                .show(ui, |ui| {
-                                    ui.label(RichText::new(session_id).monospace().size(11.5).color(INK));
-                                });
-                        });
-
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let copied = self.copied_target.as_ref().map_or(false, |(k, t)| {
-                                k == "session" && t.elapsed() < Duration::from_secs(2)
-                            });
-                            if secondary(ui, if copied { "Copied ID!" } else { "Copy ID" }) {
-                                copy_text("05066c5f2baada426862c0b28af13b484ab99618cc9e117eee3484f5f571b28d5c");
-                                self.copied_target = Some(("session".to_string(), Instant::now()));
-                            }
-                        });
-                    });
-                });
-
-                ui.add_space(8.0);
-
-
-                row_frame(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if let Some(tex) = &self.discord_icon {
-                            ui.add(
-                                egui::Image::new(tex)
-                                    .fit_to_exact_size(egui::vec2(28.0, 28.0))
-                                    .rounding(6.0),
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(RichText::new("Discord Profile").size(13.5).color(INK));
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new("@tooksomemore").size(13.5).color(MINT));
-                                ui.label(RichText::new("(might be banned -w-)").size(12.0).color(WARN));
-                            });
-                        });
-
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let copied = self.copied_target.as_ref().map_or(false, |(k, t)| {
-                                k == "dc_profile" && t.elapsed() < Duration::from_secs(2)
-                            });
-                            if secondary(ui, if copied { "Copied!" } else { "Copy Username" }) {
-                                copy_text("@tooksomemore");
-                                self.copied_target = Some(("dc_profile".to_string(), Instant::now()));
-                            }
-                        });
-                    });
-                });
-
-                ui.add_space(8.0);
-
-
-                row_frame(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if let Some(tex) = &self.signal_icon {
-                            ui.add(
-                                egui::Image::new(tex)
-                                    .fit_to_exact_size(egui::vec2(28.0, 28.0))
-                                    .rounding(6.0),
-                            );
-                        }
-                        ui.add_space(8.0);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.label(RichText::new("Signal").size(13.5).color(INK));
-                            ui.label(RichText::new("misery.6767").monospace().size(13.5).color(INK));
-                        });
-
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let copied = self.copied_target.as_ref().map_or(false, |(k, t)| {
-                                k == "signal" && t.elapsed() < Duration::from_secs(2)
-                            });
-                            if secondary(ui, if copied { "Copied!" } else { "Copy Username" }) {
-                                copy_text("misery.6767");
-                                self.copied_target = Some(("signal".to_string(), Instant::now()));
-                            }
-                        });
-                    });
-                });
-            });
-
-            ui.add_space(14.0);
-
-
-            card(ui, Some("DONATE"), |ui| {
-
-                egui::Frame::none()
-                    .fill(FIELD)
-                    .rounding(10.0)
-                    .inner_margin(Margin::symmetric(12.0, 7.0))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            if let Some(tex) = &self.throne_icon {
-                                ui.add(
-                                    egui::Image::new(tex)
-                                        .fit_to_exact_size(egui::vec2(22.0, 22.0))
-                                        .rounding(11.0),
-                                );
-                                ui.add_space(4.0);
-                            }
-                            ui.label(RichText::new("Throne").size(13.0).strong().color(INK));
-                            ui.label(RichText::new("Wishlist").size(12.5).color(DIM));
-                            ui.add_space(6.0);
-                            ui.label(RichText::new("throne.com/novemberouppy").monospace().size(11.5).color(MINT));
-
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let copied = self.copied_target.as_ref().map_or(false, |(k, t)| {
-                                    k == "throne" && t.elapsed() < Duration::from_secs(2)
-                                });
-                                if secondary(ui, if copied { "Copied!" } else { "Copy Link" }) {
-                                    copy_text("https://throne.com/novemberouppy");
-                                    self.copied_target = Some(("throne".to_string(), Instant::now()));
-                                }
-                                ui.add_space(4.0);
-
-                                let purple = Color32::from_rgb(139, 92, 246);
-                                let purple_hover = Color32::from_rgb(167, 139, 250);
-                                let clicked = ui
-                                    .scope(|ui| {
-                                        let w = &mut ui.visuals_mut().widgets;
-                                        w.inactive.weak_bg_fill = purple;
-                                        w.hovered.weak_bg_fill = purple_hover;
-                                        w.active.weak_bg_fill = purple;
-                                        for s in [&mut w.inactive, &mut w.hovered, &mut w.active] {
-                                            s.fg_stroke.color = Color32::WHITE;
-                                        }
-                                        ui.add(
-                                            egui::Button::new(
-                                                RichText::new("Open Throne ->")
-                                                    .size(13.0)
-                                                    .color(Color32::WHITE),
-                                            )
-                                            .rounding(egui::Rounding::same(PILL))
-                                            .min_size(egui::vec2(0.0, 30.0)),
-                                        )
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .clicked()
-                                    })
-                                    .inner;
-
-                                if clicked {
-                                    crate::ui::sound::play_click();
-                                    ui.ctx().open_url(egui::OpenUrl::new_tab("https://throne.com/novemberouppy"));
-                                }
-                            });
-                        });
-                    });
-
-                ui.add_space(8.0);
-
-                let icons = self.crypto_icons.as_ref();
-                let donations: [(&str, &str, &str, Option<&egui::TextureHandle>); 7] = [
-                    ("LTC", "Litecoin", "LLxL3cyJ6AKYve6Hixc6JQaB9AMcJtzmJT", icons.map(|i| &i.ltc)),
-                    ("XRP", "XRP", "rHT2p9ykb2D38t3egT1dACMNVEM91HNpNJ", icons.map(|i| &i.xrp)),
-                    ("DOGE", "Dogecoin", "DEbZhNnGzqmJAPNrqx2DEMrjy5FowfgtkR", icons.map(|i| &i.doge)),
-                    ("SOL", "Solana", "7Hc9ZZgZsp94Dn4wecFNAcVqwLK9z5vfkz8tws2aNxfS", icons.map(|i| &i.sol)),
-                    ("ETH", "Ethereum", "0x7d74dFc51E795138442e5E8fa38ca592800A9927", icons.map(|i| &i.eth)),
-                    ("BTC", "Bitcoin", "bc1qzr9kk9hf649w54w5adgw5l04uwymwlgj907kqx", icons.map(|i| &i.btc)),
-                    ("USDC", "USD Coin", "0x7d74dFc51E795138442e5E8fa38ca592800A9927", icons.map(|i| &i.usdc)),
-                ];
-
-                for (i, (ticker, name, addr, icon)) in donations.iter().enumerate() {
-                    if i > 0 {
-                        ui.add_space(6.0);
+            row_frame(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(tex) = &self.signal_icon {
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(22.0, 22.0)).rounding(5.0));
+                        ui.add_space(10.0);
                     }
-                    egui::Frame::none()
-                        .fill(FIELD)
-                        .rounding(10.0)
-                        .inner_margin(Margin::symmetric(12.0, 7.0))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                if let Some(tex) = icon {
-                                    ui.add(
-                                        egui::Image::new(*tex)
-                                            .fit_to_exact_size(egui::vec2(22.0, 22.0))
-                                            .rounding(11.0),
-                                    );
-                                    ui.add_space(4.0);
-                                }
-                                ui.label(RichText::new(*ticker).size(13.0).strong().color(INK));
-                                ui.label(RichText::new(*name).size(12.5).color(DIM));
-                                ui.add_space(6.0);
-                                ui.label(RichText::new(*addr).monospace().size(11.5).color(INK));
-
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let copied = self.copied_target.as_ref().map_or(false, |(k, t)| {
-                                        k == *ticker && t.elapsed() < Duration::from_secs(2)
-                                    });
-                                    if secondary(ui, if copied { "Copied!" } else { "Copy" }) {
-                                        copy_text(addr);
-                                        self.copied_target = Some((ticker.to_string(), Instant::now()));
-                                    }
-                                });
-                            });
-                        });
-                }
+                    ui.label(RichText::new("signal").size(T_BODY).color(TX));
+                    ui.label(RichText::new("misery.6767").monospace().size(T_META).color(TX_FAINT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let copied = self.copied_target.as_ref().map_or(false, |(k, t)| k == "signal" && t.elapsed() < Duration::from_secs(2));
+                        if quiet(ui, if copied { "copied" } else { "copy" }) {
+                            copy_text("misery.6767");
+                            self.copied_target = Some(("signal".to_string(), Instant::now()));
+                        }
+                    });
+                });
             });
-            ui.add_space(16.0);
+
+            group(ui, "support");
+            row_frame(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(tex) = &self.throne_icon {
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(18.0, 18.0)).rounding(9.0));
+                        ui.add_space(10.0);
+                    }
+                    ui.label(RichText::new("throne").size(T_BODY).color(TX));
+                    ui.label(RichText::new("throne.com/novemberouppy").monospace().size(T_META).color(TX_FAINT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let copied = self.copied_target.as_ref().map_or(false, |(k, t)| k == "throne" && t.elapsed() < Duration::from_secs(2));
+                        if quiet(ui, if copied { "copied" } else { "copy" }) {
+                            copy_text("https://throne.com/novemberouppy");
+                            self.copied_target = Some(("throne".to_string(), Instant::now()));
+                        }
+                        if quiet(ui, "open") {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab("https://throne.com/novemberouppy"));
+                        }
+                    });
+                });
+            });
+
+            let icons = self.crypto_icons.as_ref();
+            let donations: [(&str, &str, Option<&egui::TextureHandle>); 7] = [
+                ("LTC", "LLxL3cyJ6AKYve6Hixc6JQaB9AMcJtzmJT", icons.map(|i| &i.ltc)),
+                ("XRP", "rHT2p9ykb2D38t3egT1dACMNVEM91HNpNJ", icons.map(|i| &i.xrp)),
+                ("DOGE", "DEbZhNnGzqmJAPNrqx2DEMrjy5FowfgtkR", icons.map(|i| &i.doge)),
+                ("SOL", "7Hc9ZZgZsp94Dn4wecFNAcVqwLK9z5vfkz8tws2aNxfS", icons.map(|i| &i.sol)),
+                ("ETH", "0x7d74dFc51E795138442e5E8fa38ca592800A9927", icons.map(|i| &i.eth)),
+                ("BTC", "bc1qzr9kk9hf649w54w5adgw5l04uwymwlgj907kqx", icons.map(|i| &i.btc)),
+                ("USDC", "0x7d74dFc51E795138442e5E8fa38ca592800A9927", icons.map(|i| &i.usdc)),
+            ];
+            for (ticker, addr, icon) in donations.iter() {
+                row_frame(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(tex) = icon {
+                            ui.add(egui::Image::new(*tex).fit_to_exact_size(egui::vec2(18.0, 18.0)).rounding(9.0));
+                            ui.add_space(10.0);
+                        }
+                        ui.label(RichText::new(*ticker).size(T_META).color(TX_DIM));
+                        ui.label(RichText::new(*addr).monospace().size(T_TINY).color(TX_FAINT));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let copied = self.copied_target.as_ref().map_or(false, |(k, t)| k == *ticker && t.elapsed() < Duration::from_secs(2));
+                            if quiet(ui, if copied { "copied" } else { "copy" }) {
+                                copy_text(addr);
+                                self.copied_target = Some((ticker.to_string(), Instant::now()));
+                            }
+                        });
+                    });
+                });
+            }
+
+            group(ui, "updates");
+            self.render_updates_inline(ui);
+            ui.add_space(24.0);
+            });
         });
     }
 
@@ -2368,299 +2412,141 @@ impl NepApp {
             .install_and_restart(staged_path.to_path_buf(), None, Vec::new());
     }
 
-    fn render_updates(&mut self, ui: &mut egui::Ui) {
+    fn render_updates_inline(&mut self, ui: &mut egui::Ui) {
+        use crate::update::UpdateState;
         let state = self.update_manager.state();
-
-        ScrollArea::vertical().id_salt("app_scroll_5").auto_shrink([false, false]).show(ui, |ui| {
-
-
-            page_header(
-                ui,
-                "Updates",
-                "Release channels and software updates.",
-            );
-
-
-            card(ui, None, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Installed  v{}", env!("CARGO_PKG_VERSION"))).size(14.0).color(INK));
-
-                    ui.add_space(6.0);
-
-
-                    match &state {
-                        crate::update::UpdateState::Idle
-                        | crate::update::UpdateState::UpToDate { .. } => {
-                            ui.label(RichText::new("·").size(14.0).color(DIM));
-                            ui.label(RichText::new("up to date").size(13.0).color(MINT));
-                        }
-                        crate::update::UpdateState::Checking => {
-                            ui.label(RichText::new("·").size(14.0).color(DIM));
-                            ui.label(RichText::new("checking...").size(13.0).color(DIM));
-                        }
-                        crate::update::UpdateState::Available(rel) => {
-                            ui.label(RichText::new("·").size(14.0).color(DIM));
-                            ui.label(RichText::new(format!("v{} available", rel.version)).size(13.0).color(MINT).strong());
-                        }
-                        crate::update::UpdateState::Downloading { progress, .. } => {
-                            ui.label(RichText::new("·").size(14.0).color(DIM));
-                            ui.label(RichText::new(format!("downloading {:.0}%", progress * 100.0)).size(13.0).color(MINT));
-                        }
-                        crate::update::UpdateState::ReadyToInstall(rel, _) => {
-                            ui.label(RichText::new("·").size(14.0).color(DIM));
-                            ui.label(RichText::new(format!("v{} ready to apply", rel.version)).size(13.0).color(MINT).strong());
-                        }
-                        crate::update::UpdateState::Installing
-                        | crate::update::UpdateState::RestartRequired => {
-                            ui.label(RichText::new("·").size(14.0).color(DIM));
-                            ui.label(RichText::new("restarting...").size(13.0).color(MINT));
-                        }
-                        crate::update::UpdateState::Failed { .. } => {
-                            ui.label(RichText::new("·").size(14.0).color(DIM));
-                            ui.label(RichText::new("check failed").size(13.0).color(ERR));
-                        }
-                        crate::update::UpdateState::Cancelled => {
-                            ui.label(RichText::new("·").size(14.0).color(DIM));
-                            ui.label(RichText::new("cancelled").size(13.0).color(DIM));
-                        }
+        let (line, color) = match &state {
+            UpdateState::Idle | UpdateState::UpToDate { .. } => ("up to date".to_string(), TX_FAINT),
+            UpdateState::Checking => ("checking…".to_string(), TX_FAINT),
+            UpdateState::Available(rel) => (format!("v{} available", rel.version), BRUISE_LIT),
+            UpdateState::Downloading { progress, .. } => (format!("downloading {:.0}%", progress * 100.0), BRUISE_LIT),
+            UpdateState::ReadyToInstall(rel, _) => (format!("v{} ready", rel.version), BRUISE_LIT),
+            UpdateState::Installing | UpdateState::RestartRequired => ("restarting…".to_string(), BRUISE_LIT),
+            UpdateState::Failed { .. } => ("check failed".to_string(), RED_LIT),
+            UpdateState::Cancelled => ("cancelled".to_string(), TX_FAINT),
+        };
+        let mut check = false;
+        let mut download = None;
+        let mut apply = None;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(T_BODY).color(TX));
+            ui.label(RichText::new(line).size(T_META).color(color));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                match &state {
+                    UpdateState::Idle | UpdateState::UpToDate { .. } | UpdateState::Cancelled => {
+                        check = quiet(ui, "check");
                     }
-
-
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let mut channel = self.config.update_channel.clone();
-                        let channel_options = [
-                            ("nightly", "nightly"),
-                            ("beta", "beta"),
-                            ("stable", "stable"),
-                        ];
-                        if segmented(ui, &mut channel, &channel_options) {
-                            self.config.update_channel = channel;
-                            save_config(&self.config);
-                            self.check_for_updates_action();
-                        }
-                    });
-                });
-
-                ui.add_space(10.0);
-
-
-                ui.horizontal(|ui| {
-                    match &state {
-                        crate::update::UpdateState::Idle
-                        | crate::update::UpdateState::UpToDate { .. }
-                        | crate::update::UpdateState::Cancelled => {
-                            if primary(ui, "Check for updates", true) {
-                                self.check_for_updates_action();
-                            }
-                        }
-                        crate::update::UpdateState::Checking => {
-                            primary(ui, "Checking...", false);
-                        }
-                        crate::update::UpdateState::Available(rel) => {
-                            let rel_clone = rel.clone();
-                            if primary(ui, "Download & install", true) {
-                                self.update_manager.start_download(rel_clone);
-                            }
-                            if secondary(ui, "Check again") {
-                                self.check_for_updates_action();
-                            }
-                        }
-                        crate::update::UpdateState::Downloading { .. } => {
-                            if secondary(ui, "Cancel download") {
-                                self.update_manager.cancel_download();
-                            }
-                        }
-                        crate::update::UpdateState::ReadyToInstall(rel, staged_path) => {
-                            let rel_clone = rel.clone();
-                            let path_clone = staged_path.clone();
-                            if primary(ui, "Restart & apply", true) {
-                                self.apply_update_and_restart(&rel_clone, &path_clone);
-                            }
-                        }
-                        crate::update::UpdateState::Installing
-                        | crate::update::UpdateState::RestartRequired => {
-                            primary(ui, "Restarting...", false);
-                        }
-                        crate::update::UpdateState::Failed { .. } => {
-                            if primary(ui, "Retry check", true) {
-                                self.check_for_updates_action();
-                            }
-                        }
+                    UpdateState::Checking => {
+                        ui.label(RichText::new("checking").size(T_META).color(TX_FAINT));
                     }
-                });
-
-                if let crate::update::UpdateState::Failed { error, .. } = &state {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new(error).size(12.0).color(ERR));
-                }
-
-
-                if let crate::update::UpdateState::Downloading {
-                    downloaded_bytes,
-                    total_bytes,
-                    progress,
-                    speed_bps,
-                } = &state
-                {
-                    ui.add_space(8.0);
-                    let (rect, _) = ui.allocate_exact_size(
-                        Vec2::new(ui.available_width(), 6.0),
-                        Sense::hover(),
-                    );
-                    ui.painter().rect_filled(rect, Rounding::same(3.0), FIELD_LO);
-                    let fill_w = (rect.width() * progress.clamp(0.0, 1.0)).clamp(0.0, rect.width());
-                    if fill_w > 0.0 {
-                        let fill_rect = egui::Rect::from_min_size(rect.min, Vec2::new(fill_w, 6.0));
-                        ui.painter().rect_filled(fill_rect, Rounding::same(3.0), MINT);
+                    UpdateState::Available(rel) => {
+                        download = Some(rel.clone());
+                        check = quiet(ui, "again");
                     }
-                    ui.add_space(4.0);
-                    let dl_mb = *downloaded_bytes as f64 / (1024.0 * 1024.0);
-                    let tot_mb = *total_bytes as f64 / (1024.0 * 1024.0);
-                    let spd_mb = *speed_bps as f64 / (1024.0 * 1024.0);
-                    ui.label(muted(format!("{:.1} / {:.1} MB · {:.1} MB/s · {:.0}%", dl_mb, tot_mb, spd_mb, progress * 100.0)));
+                    UpdateState::Downloading { .. } => {
+                        cancel = quiet(ui, "cancel");
+                    }
+                    UpdateState::ReadyToInstall(rel, path) => {
+                        apply = Some((rel.clone(), path.clone()));
+                        ui.label(RichText::new("ready").size(T_META).color(BRUISE_LIT));
+                    }
+                    UpdateState::Installing | UpdateState::RestartRequired => {
+                        ui.label(RichText::new("restarting").size(T_META).color(BRUISE_LIT));
+                    }
+                    UpdateState::Failed { .. } => {
+                        check = quiet(ui, "retry");
+                    }
                 }
             });
-
-            ui.add_space(10.0);
-
-
-            let release_opt = match &state {
-                crate::update::UpdateState::Available(rel) => Some(rel),
-                crate::update::UpdateState::ReadyToInstall(rel, _) => Some(rel),
-                _ => None,
-            };
-
-            if let Some(rel) = release_opt {
-                card(ui, Some("Release notes"), |ui| {
-                    ui.horizontal(|ui| {
-                        let title = if rel.title.is_empty() {
-                            format!("v{}", rel.version)
-                        } else {
-                            rel.title.clone()
-                        };
-                        ui.label(RichText::new(&title).size(15.0).color(INK).strong());
-                        if !rel.release_date.is_empty() {
-                            ui.label(muted(&rel.release_date));
-                        }
-                    });
-                    ui.add_space(6.0);
-                    for line in rel.notes.lines() {
-                        let trimmed = line.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        let bullet = trimmed.trim_start_matches(|c| c == '•' || c == '-' || c == '*' || c == ' ');
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("•").size(13.0).color(MINT));
-                            ui.label(RichText::new(bullet).size(13.0).color(INK));
-                        });
-                    }
-                });
-                ui.add_space(10.0);
-            }
-
-
-            card(ui, Some("Preferences"), |ui| {
-                let prev_auto = self.config.auto_update;
-                toggle(
-                    ui,
-                    &mut self.config.auto_update,
-                    "Automatically check for updates on startup",
-                );
-                if prev_auto != self.config.auto_update {
-                    save_config(&self.config);
-                }
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(muted("Update source"));
-                    let mut source_type = self.config.update_source_type.clone();
-                    let sources = [
-                        ("github", "github (default)"),
-                        ("master", "master (custom)"),
-                        ("direct", "custom url"),
-                    ];
-                    if segmented(ui, &mut source_type, &sources) {
-                        self.config.update_source_type = source_type;
-                        save_config(&self.config);
-                    }
-                });
-
-                if self.config.update_source_type == "direct" {
-                    ui.add_space(6.0);
-                    let mut custom_url = self.config.update_source_url.clone();
-                    let changed = text_input(
-                        ui,
-                        egui::Id::new("custom_update_source_url"),
-                        &mut custom_url,
-                        "https://example.com/manifest.json",
-                        f32::INFINITY,
-                    )
-                    .changed();
-                    if changed {
-                        self.config.update_source_url = custom_url;
-                        save_config(&self.config);
-                    }
-                } else if self.config.update_source_type == "master" {
-                    ui.add_space(4.0);
-                    let host = if self.config.update_source_url.is_empty() {
-                        "uses GitHub releases (default)"
-                    } else {
-                        &self.config.update_source_url
-                    };
-                    ui.label(muted(format!("Endpoint: {}", host)));
-                } else if self.config.update_source_type == "github" {
-                    ui.add_space(4.0);
-                    let repo = if self.config.update_source_url.is_empty() {
-                        "novembahh/puppytunnelrblx"
-                    } else {
-                        &self.config.update_source_url
-                    };
-                    ui.label(muted(format!("Endpoint: github.com/{}", repo)));
-                }
-            });
-
-            ui.add_space(10.0);
-
-
-            if !self.config.update_history.is_empty() {
-                card(ui, Some("History"), |ui| {
-                    for entry in self.config.update_history.iter().rev().take(5) {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(&entry.version).size(13.0).color(MINT).strong());
-                            ui.label(muted("·"));
-                            ui.label(RichText::new(&entry.title).size(13.0).color(INK));
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.label(muted(&entry.installed_at));
-                            });
-                        });
-                        ui.add_space(3.0);
-                    }
-                });
-                ui.add_space(10.0);
-            }
         });
-    }
-}
-
-fn notes(ui: &mut egui::Ui, addr: &str, relay: &str) {
-    if !relay.trim().is_empty() {
-        ui.label(RichText::new("Traffic goes through your relay. Players never see your IP.").size(12.5).color(MINT));
-        return;
-    }
-    for w in tunnel_addr_warnings(addr) {
-        ui.label(RichText::new(w).size(12.5).color(WARN));
-    }
-}
-
-fn path_field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, mut browse: impl FnMut()) {
-    ui.label(muted(label));
-    ui.horizontal(|ui| {
-        let w = ui.available_width() - 96.0;
-        text_input(ui, egui::Id::new(("path", label)), value, hint, w);
-        if secondary(ui, "Browse") {
-            browse();
+        if let UpdateState::Downloading { downloaded_bytes, total_bytes, progress: frac, speed_bps } = &state {
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!(
+                    "{:.1} / {:.1} MB · {:.1} MB/s",
+                    *downloaded_bytes as f64 / 1048576.0,
+                    *total_bytes as f64 / 1048576.0,
+                    *speed_bps as f64 / 1048576.0
+                ))
+                .size(T_META)
+                .color(TX_FAINT),
+            );
+            progress(ui, *frac);
         }
-    });
-    ui.add_space(6.0);
+        if let UpdateState::Failed { error, .. } = &state {
+            ui.add_space(6.0);
+            ui.label(RichText::new(error).size(T_META).color(RED_LIT));
+        }
+        if let Some(rel) = match &state {
+            UpdateState::Available(rel) => Some(rel),
+            UpdateState::ReadyToInstall(rel, _) => Some(rel),
+            _ => None,
+        } {
+            if !rel.notes.trim().is_empty() {
+                ui.add_space(10.0);
+                for line in rel.notes.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let bullet = trimmed.trim_start_matches(|c| c == '•' || c == '-' || c == '*' || c == ' ');
+                    ui.label(RichText::new(bullet).size(T_META).color(TX_FAINT));
+                }
+            }
+        }
+        ui.add_space(12.0);
+        let mut channel = self.config.update_channel.clone();
+        let options = [("nightly", "nightly"), ("beta", "beta"), ("stable", "stable")];
+        if segmented(ui, &mut channel, &options) {
+            self.config.update_channel = channel;
+            save_config(&self.config);
+            self.check_for_updates_action();
+        }
+        ui.add_space(8.0);
+        let prev_auto = self.config.auto_update;
+        toggle_row(ui, &mut self.config.auto_update, "check on startup");
+        if prev_auto != self.config.auto_update {
+            save_config(&self.config);
+        }
+        if check {
+            self.check_for_updates_action();
+        }
+        if let Some(rel) = download {
+            self.update_manager.start_download(rel);
+        }
+        if cancel {
+            self.update_manager.cancel_download();
+        }
+        if let Some((rel, path)) = apply {
+            self.apply_update_and_restart(&rel, &path);
+        }
+    }
 }
+
+fn file_label(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn elide(painter: &egui::Painter, text: &str, font: FontId, width: f32) -> String {
+    let fits = |s: &str| painter.layout_no_wrap(s.to_string(), font.clone(), Color32::PLACEHOLDER).size().x <= width;
+    if fits(text) {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let candidate: String = chars[..mid].iter().collect::<String>() + "…";
+        if fits(&candidate) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    format!("{}…", chars[..lo].iter().collect::<String>().trim_end())
+}
+
