@@ -725,7 +725,7 @@ pub struct MasterOptions {
     pub persist_profiles_cache: bool,
     pub data_dir: Option<std::path::PathBuf>,
     pub strict_profiles: bool,
-    pub game_port: Option<u16>,
+    pub relay_port: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -738,7 +738,7 @@ struct Ctx {
     data_dir: std::path::PathBuf,
     strict_profiles: bool,
     zones: GameDomains,
-    game_port: Option<u16>,
+    relay_port: Option<u16>,
 }
 
 pub struct MasterServer {
@@ -783,7 +783,7 @@ impl MasterServer {
             persist_profiles: opts.persist_profiles_cache,
             strict_profiles: opts.strict_profiles,
             zones: GameDomains::load(&data_dir.join(GAME_ZONES_FILE)),
-            game_port: opts.game_port.filter(|p| *p != 0),
+            relay_port: opts.relay_port.filter(|p| *p != 0),
             data_dir,
         };
         for signed in stored_profiles {
@@ -1129,7 +1129,7 @@ fn handle(mut req: Request, ctx: &Ctx, trust_proxy: bool) {
                     listing: {
                         let mut l = e.listing.clone();
                         if l.game.is_none() && l.nep == Some(true) {
-                            l.game = ctx.game_port.and_then(|port| {
+                            l.game = ctx.relay_port.and_then(|port| {
                                 parse_invite(&l.invite).and_then(|(_, _, token)| {
                                     let addr = ctx.zones.zone_for(&crate::net::relay::session_label(&token)).address(&token, port);
                                     (!addr.is_empty()).then_some(addr)
@@ -2950,7 +2950,7 @@ mod tests {
     fn strict_profile_names_gated() {
         let id = Identity::profile("test-secret");
         let mk = |display_name: &str| SignedProfile::sign(&id, profile::ProfileBody { roblox_id: 7, display_name: display_name.into(), bio: "hi".into(), accent: "mint".into(), ts: 0 });
-        let ctx = |strict: bool| Ctx { roblox: String::new(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::path::PathBuf::new(), strict_profiles: strict, zones: GameDomains::default(), game_port: None };
+        let ctx = |strict: bool| Ctx { roblox: String::new(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::path::PathBuf::new(), strict_profiles: strict, zones: GameDomains::default(), relay_port: None };
         assert!(ingest_profile(&ctx(false), mk("   "), "127.0.0.1").is_ok());
         assert_eq!(ingest_profile(&ctx(true), mk("   "), "127.0.0.1"), Err((400, "display name is required")));
         assert!(ingest_profile(&ctx(true), mk("Somebody"), "127.0.0.1").is_ok());
@@ -3062,7 +3062,7 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(errs.len(), 1);
 
-        let ctx = Ctx { roblox: rbxapi::USERS_API.to_string(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::env::temp_dir(), strict_profiles: false, zones: GameDomains::default(), game_port: None };
+        let ctx = Ctx { roblox: rbxapi::USERS_API.to_string(), state: Arc::new(Mutex::new(State::default())), probes: Arc::new(AtomicUsize::new(0)), allow_private: true, persist_profiles: false, data_dir: std::env::temp_dir(), strict_profiles: false, zones: GameDomains::default(), relay_port: None };
         let mut forged = SignedAnnounce::sign(&host.id, body("Legit", &host.invite));
         forged.body.description = "send me your password".into();
         assert!(ingest(&ctx, forged, "", true).is_err());

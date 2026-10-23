@@ -116,6 +116,8 @@ enum Cmd {
         data_dir: Option<PathBuf>,
         #[arg(long, default_value_t = 0)]
         pool_ports: usize,
+        #[arg(long)]
+        pool_start: Option<u16>,
     },
     Master {
         #[arg(long)]
@@ -262,7 +264,7 @@ fn main() {
         || args.echo_client.is_some()
         || args.test.is_some();
 
-    let mut relay_listen: Option<(String, Option<String>, usize, master::MasterOptions)> = None;
+    let mut relay_listen: Option<(String, Option<String>, usize, Option<u16>, master::MasterOptions)> = None;
     let mut doctor = false;
     let mut profile_cmd = None;
     let mut master_cmd: Option<(String, master::MasterOptions)> = None;
@@ -271,8 +273,8 @@ fn main() {
     if let Some(cmd) = args.cmd.take() {
         headless = true;
         match cmd {
-            Cmd::Relay { listen, with_master, trust_proxy, peer, allow_private_relays, data_dir, strict_profiles, pool_ports } => {
-                relay_listen = Some((listen, with_master, pool_ports, master::MasterOptions { trust_proxy, peers: peer, allow_private_relays, strict_profiles, roblox_api: None, persist_profiles_cache: true, data_dir: data_dir.clone(), ..Default::default() }))
+            Cmd::Relay { listen, with_master, trust_proxy, peer, allow_private_relays, data_dir, strict_profiles, pool_ports, pool_start } => {
+                relay_listen = Some((listen, with_master, pool_ports, pool_start, master::MasterOptions { trust_proxy, peers: peer, allow_private_relays, strict_profiles, roblox_api: None, persist_profiles_cache: true, data_dir: data_dir.clone(), ..Default::default() }))
             }
             Cmd::Master { listen, trust_proxy, peer, allow_private_relays, data_dir, strict_profiles } => {
                 master_cmd = Some((listen, master::MasterOptions { trust_proxy, peers: peer, allow_private_relays, strict_profiles, roblox_api: None, persist_profiles_cache: true, data_dir: data_dir.clone(), ..Default::default() }))
@@ -317,8 +319,8 @@ fn main() {
     }
 
     if headless {
-        let code = if let Some((listen, with_master, pool, opts)) = relay_listen {
-            run_relay(&listen, with_master.as_deref(), pool, opts)
+        let code = if let Some((listen, with_master, pool, pool_start, opts)) = relay_listen {
+            run_relay(&listen, with_master.as_deref(), pool, pool_start, opts)
         } else if let Some((listen, opts)) = master_cmd {
             run_master(&listen, opts)
         } else if let Some((query, tag, sort)) = browse {
@@ -499,7 +501,7 @@ fn run_fleet(args: Cli, count: u16, stagger: u64) -> i32 {
     0
 }
 
-fn run_relay(listen: &str, with_master: Option<&str>, pool: usize, opts: master::MasterOptions) -> i32 {
+fn run_relay(listen: &str, with_master: Option<&str>, pool: usize, pool_start: Option<u16>, opts: master::MasterOptions) -> i32 {
     let addr: SocketAddr = match listen.parse() {
         Ok(a) => a,
         Err(_) => {
@@ -513,7 +515,7 @@ fn run_relay(listen: &str, with_master: Option<&str>, pool: usize, opts: master:
         let opts = {
             let mut o = opts;
             if pool == 0 {
-                o.game_port.get_or_insert(addr.port());
+                o.relay_port.get_or_insert(addr.port());
             }
             o
         };
@@ -528,16 +530,17 @@ fn run_relay(listen: &str, with_master: Option<&str>, pool: usize, opts: master:
             }
         }
     }
-    match RelayServer::start_with_ingress(addr, pool, |m| println!("[{}] relay: {}", ts(), m)) {
+    match RelayServer::start_with_pool(addr, pool, pool_start, |m| println!("[{}] relay: {}", ts(), m)) {
         Ok(mut relay) => {
             println!("[{}] Relay listening on udp://{}. Ctrl+C to stop.", ts(), addr);
             println!("[{}] Open this UDP port on the VPS firewall. Hosts run: puppytunnel host --relay <this-ip>:{}", ts(), addr.port());
             if pool > 0 {
+                let first = pool_start.unwrap_or(addr.port().saturating_add(1));
                 println!(
                     "[{}] Game slots use udp/{}-{}. Forward that whole range to this host for plain Neptunnel joins.",
                     ts(),
-                    addr.port() + 1,
-                    addr.port() + pool as u16
+                    first,
+                    first.saturating_add(pool as u16 - 1)
                 );
             }
             sleep_until_stopped(&stop);
@@ -1328,7 +1331,7 @@ fn run_host(config: &config::AppConfig, studio: &str, nep: bool, stop: &Arc<Atom
                     };
                     let addr = net::relay::game_address(&zone, &id.token(), port as u16);
                     if addr.is_empty() {
-                        println!("[{}] Neptunnel players join with {}:{}", ts(), relay, port);
+                        println!("[{}] Neptunnel players join with {}:{} (no zone assigned)", ts(), relay, port);
                     } else {
                         println!("[{}] Neptunnel players join with {}", ts(), addr);
                     }

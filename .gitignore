@@ -65,6 +65,12 @@ Thumbs.db
 
 # Local scratch verification scripts
 __tmp_*
+__*
+
+# Local build dirs
+.build_tmp/
+~/
+-;
 
 # IDA analysis databases
 *.id0

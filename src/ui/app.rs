@@ -1310,11 +1310,13 @@ impl NepApp {
             return;
         }
         self.game_port_poll = None;
-        let relay = self.config.relay.trim().to_string();
         let addr = crate::net::relay::game_address(&zone, &self.game_token, port as u16);
-        let shown = if addr.is_empty() { relay } else { addr };
-        self.add_log(&format!("Neptunnel players join with {}", shown), "ok");
-        self.raw_join = Some(shown);
+        if addr.is_empty() {
+            self.game_port_poll = Some(Instant::now());
+            return;
+        }
+        self.add_log(&format!("Neptunnel players join with {}", addr), "ok");
+        self.raw_join = Some(addr);
     }
 
     fn render_host_running(&mut self, ui: &mut egui::Ui) {

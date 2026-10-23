@@ -318,6 +318,13 @@ impl RelayServer {
     where
         L: Fn(&str) + Send + 'static,
     {
+        Self::start_with_pool(listen, ingress, None, log)
+    }
+
+    pub fn start_with_pool<L>(listen: SocketAddr, ingress: usize, pool_start: Option<u16>, log: L) -> io::Result<Self>
+    where
+        L: Fn(&str) + Send + 'static,
+    {
         let sock = UdpSocket::bind(listen)?;
         sock.set_read_timeout(Some(Duration::from_millis(500)))?;
         let running = Arc::new(AtomicBool::new(true));
@@ -331,34 +338,11 @@ impl RelayServer {
             let mut slots: HashMap<u16, Token> = HashMap::new();
             let mut shared: Option<Token> = None;
             let (slot_tx, slot_rx) = std::sync::mpsc::channel::<(u16, Vec<u8>, SocketAddr)>();
-            let mut slot_workers: Vec<JoinHandle<()>> = Vec::new();
+            let mut slot_workers: HashMap<u16, (JoinHandle<()>, Arc<AtomicBool>)> = HashMap::new();
             let base_port = listen.port();
-            let mut bound_slots: Vec<u16> = Vec::new();
-            for i in 1..=ingress {
-                let port = match base_port.checked_add(i as u16) {
-                    Some(p) => p,
-                    None => break,
-                };
-                let Ok(sk) = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))) else { continue };
-                bound_slots.push(port);
-                let _ = sk.set_read_timeout(Some(Duration::from_millis(200)));
-                let sk = Arc::new(sk);
-                let tx = slot_tx.clone();
-                let run_s = Arc::clone(&run);
-                slot_workers.push(thread::spawn(move || {
-                    let mut b = vec![0u8; 65536];
-                    while run_s.load(Ordering::SeqCst) {
-                        match sk.recv_from(&mut b) {
-                            Ok((n, from)) if n > 0 => {
-                                let _ = tx.send((port, b[..n].to_vec(), from));
-                            }
-                            Ok(_) => {}
-                            Err(ref e) if is_transient(e) => continue,
-                            Err(_) => break,
-                        }
-                    }
-                }));
-            }
+            let first = pool_start.filter(|p| *p != 0).unwrap_or_else(|| base_port.saturating_add(1));
+            let pool_end = first.saturating_add(ingress.min(u16::MAX as usize) as u16).saturating_sub(1);
+            let mut pool_cursor = first;
             let mut last_unframed_warn = Instant::now() - Duration::from_secs(60);
             let mut clients: HashMap<SocketAddr, ClientEntry> = HashMap::new();
             let mut cids: HashMap<u32, SocketAddr> = HashMap::new();
@@ -381,7 +365,21 @@ impl RelayServer {
                     client_gates.retain(|a, _| clients.contains_key(a));
                     thread_binds.lock().unwrap_or_else(|e| e.into_inner()).prune();
                     host_gates.retain(|_, g| g.start.elapsed() < Duration::from_secs(10));
+                    let before = slots.len();
                     slots.retain(|_, t| hosts.contains_key(t));
+                    if slots.len() != before {
+                        let stale: Vec<u16> = slot_workers
+                            .keys()
+                            .copied()
+                            .filter(|port| !slots.contains_key(port))
+                            .collect();
+                        for port in stale {
+                            if let Some((handle, stop)) = slot_workers.remove(&port) {
+                                stop.store(true, Ordering::SeqCst);
+                                let _ = handle.join();
+                            }
+                        }
+                    }
                 }
 
                 while let Ok((port, data, from)) = slot_rx.try_recv() {
@@ -484,16 +482,43 @@ impl RelayServer {
                         let assigned = slots.iter().find(|(_, t)| **t == token).map(|(p, _)| *p);
                         let port = match assigned {
                             Some(p) => p,
-                            None if bound_slots.is_empty() => {
+                            None if ingress == 0 => {
                                 shared = Some(token);
                                 base_port
                             }
                             None => {
-                                if slots.len() >= bound_slots.len() {
-                                    let _ = sock.send_to(&frame(T_SLOT, &0u16.to_be_bytes()), src);
-                                    continue;
+                                let mut found = 0;
+                                for _ in 0..ingress {
+                                    let candidate = pool_cursor;
+                                    pool_cursor = if pool_cursor >= pool_end { first } else { pool_cursor + 1 };
+                                    if candidate == base_port || slots.contains_key(&candidate) {
+                                        continue;
+                                    }
+                                    let Ok(sk) = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], candidate))) else {
+                                        continue;
+                                    };
+                                    found = candidate;
+                                    let _ = sk.set_read_timeout(Some(Duration::from_millis(200)));
+                                    let sk = Arc::new(sk);
+                                    let tx = slot_tx.clone();
+                                    let worker_run = Arc::new(AtomicBool::new(true));
+                                    let run_s = Arc::clone(&worker_run);
+                                    let handle = thread::spawn(move || {
+                                        let mut b = vec![0u8; 65536];
+                                        while run_s.load(Ordering::SeqCst) {
+                                            match sk.recv_from(&mut b) {
+                                                Ok((n, from)) if n > 0 => {
+                                                    let _ = tx.send((candidate, b[..n].to_vec(), from));
+                                                }
+                                                Ok(_) => {}
+                                                Err(ref e) if is_transient(e) => continue,
+                                                Err(_) => break,
+                                            }
+                                        }
+                                    });
+                                    slot_workers.insert(candidate, (handle, worker_run));
+                                    break;
                                 }
-                                let found = bound_slots.iter().copied().find(|p| !slots.contains_key(p)).unwrap_or(0);
                                 if found == 0 {
                                     let _ = sock.send_to(&frame(T_SLOT, &0u16.to_be_bytes()), src);
                                     continue;
